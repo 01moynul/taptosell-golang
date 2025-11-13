@@ -176,33 +176,3 @@ func (h *Handlers) RegisterSupplier(c *gin.Context) {
 		"user":    user,
 	})
 }
-
-// --- User Login ---
-
-// LoginInput defines the JSON data expected for a login.
-type LoginInput struct {
-	Email    string `json:"email" binding:"required,email"`
-	Password string `json:"password"binding:"required"`
-}
-
-// Login is the handler for the /v1/login endpoint.
-func (h *Handlers) Login(c *gin.Context) {
-	// 1. --- Define Input ---
-	var input LoginInput
-
-	// 2. --- Bind & Validate JSON ---
-	if err := c.ShouldBindJSON(&input); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	// 3. --- Find User By Email (Placeholder) ---
-	// 4. --- Check Password (Placeholder) ---
-	// 5. --- Generate JWT (Placeholder) ---
-
-	// 6. --- Send Success Response (Placeholder) ---
-	c.JSON(http.StatusOK, gin.H{
-		"message": "Login successful (placeholder)",
-		"email":   input.Email,
-	})
-}

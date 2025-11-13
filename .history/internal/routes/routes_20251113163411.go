@@ -30,7 +30,6 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 		// to our new 'h.RegisterDropshipper' handler.
 		v1.POST("/register/dropshipper", h.RegisterDropshipper)
 		v1.POST("/register/supplier", h.RegisterSupplier)
-		v1.POST("/login", h.Login)
 
 		// We will add /v1/register/supplier, /v1/login, etc. here later.
 	}
