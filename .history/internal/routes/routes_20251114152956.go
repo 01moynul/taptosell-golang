@@ -89,8 +89,7 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 			// Cart Routes
 			dropshipper.GET("/cart", h.GetCart)
 			dropshipper.POST("/cart/items", h.AddToCart)
-			dropshipper.PUT("/cart/items/:product_id", h.UpdateCartItem)
-			dropshipper.DELETE("/cart/items/:product_id", h.DeleteCartItem)
+			// (We will add PUT /cart/items/:id and DELETE /cart/items/:id here later)
 		}
 	}
 
