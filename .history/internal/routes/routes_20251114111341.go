@@ -44,9 +44,6 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 					"yourUserID": userID,
 				})
 			})
-
-			// --- NEW FILE UPLOAD ROUTE ---
-			auth.POST("/supplier/documents", h.UploadSupplierDocuments)
 		}
 	}
 
