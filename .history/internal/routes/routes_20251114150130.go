@@ -68,8 +68,8 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 		// --- Manager-Only Routes (Login + Role Required) ---
 		// This group is for 'manager' and 'administrator' roles
 		manager := v1.Group("/manager")
-		manager.Use(middleware.AuthMiddleware())        // 1. Must be logged in
-		manager.Use(middleware.ManagerMiddleware(h.DB)) // 2. Must be a Manager
+		manager.Use(middleware.AuthMiddleware()) // 1. Must be logged in
+		manager.Use(h.ManagerMiddleware())       // 2. Must be a Manager
 		{
 			// Product Approval Routes
 			manager.GET("/products/pending", h.GetPendingProducts)
