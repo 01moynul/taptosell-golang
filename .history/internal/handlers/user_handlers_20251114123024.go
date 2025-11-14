@@ -14,14 +14,11 @@ import (
 	"github.com/01moynul/taptosell-golang/internal/models" // Our User models
 	"github.com/gin-gonic/gin"                             // The Gin framework
 
-	"fmt"       // For the verification code
-	"math/rand" // For generating the verification code
+	"crypto/rand" // For generating the verification code
+	"fmt"         // For the verification code
 
 	"github.com/01moynul/taptosell-golang/internal/email" // Our new email package
 )
-
-// TODO: Load this from a .env file or configuration manager
-const supplierRegistrationKey = "A_VERY_SECRET_KEY_REPLACE_LATER" // <-- ADD THIS LINE
 
 // --- User Registration ---
 
@@ -265,7 +262,7 @@ func (h *Handlers) RegisterSupplier(c *gin.Context) {
 // LoginInput defines the JSON data expected for a login.
 type LoginInput struct {
 	Email    string `json:"email" binding:"required,email"`
-	Password string `json:"password" binding:"required"`
+	Password string `json:"password"binding:"required"`
 }
 
 // Login is the handler for the /v1/login endpoint.

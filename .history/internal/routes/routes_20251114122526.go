@@ -32,11 +32,6 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 		v1.POST("/categories", h.CreateCategory)
 		v1.GET("/categories", h.GetAllCategories)
 
-		// --- Brand Routes ---
-		// TODO: Add manager protection to POST
-		v1.POST("/brands", h.CreateBrand)
-		v1.GET("/brands", h.GetAllBrands)
-
 		// --- Protected Routes (Login Required) ---
 		// We create a new group called 'auth'.
 		// .Use(middleware.AuthMiddleware()) applies our "security guard"
