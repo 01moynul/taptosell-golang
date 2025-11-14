@@ -1,7 +1,6 @@
 package models
 
 import (
-	"database/sql"
 	"errors" // For handling errors
 	"time"   // For 'created_at' and 'updated_at'
 
@@ -11,36 +10,17 @@ import (
 // User is the model for the 'users' table in our database.
 // The 'json:"..."' tags define how data is named when sent/received as JSON.
 // The 'db:"..."' tags will be used later for database operations.
-// User is the model for the 'users' table in our database.
 type User struct {
 	ID           int64     `json:"id" db:"id"`
 	Role         string    `json:"role" db:"role"`
 	Status       string    `json:"status" db:"status"`
 	Email        string    `json:"email" db:"email"`
-	PasswordHash string    `json:"-" db:"password_hash"`
+	PasswordHash string    `json:"-" db:"password_hash"` // '-' means never include this in JSON
 	FullName     string    `json:"fullName" db:"full_name"`
 	PhoneNumber  string    `json:"phoneNumber" db:"phone_number"`
 	CreatedAt    time.Time `json:"createdAt" db:"created_at"`
 	UpdatedAt    time.Time `json:"updatedAt" db:"updated_at"`
-	Version      int       `json:"-" db:"version"`
-
-	// --- New Fields for Phase 3 ---
-	// We use sql.NullString and sql.NullTime to handle
-	// fields that can be NULL in the database.
-	// 'omitempty' means they won't appear in JSON if they are empty.
-
-	CompanyName        sql.NullString `json:"companyName,omitempty" db:"company_name"`
-	ICNumber           sql.NullString `json:"icNumber,omitempty" db:"ic_number"`
-	SSMNumber          sql.NullString `json:"ssmNumber,omitempty" db:"ssm_number"`
-	AddressLine1       sql.NullString `json:"addressLine1,omitempty" db:"address_line1"`
-	AddressLine2       sql.NullString `json:"addressLine2,omitempty" db:"address_line2"`
-	City               sql.NullString `json:"city,omitempty" db:"city"`
-	State              sql.NullString `json:"state,omitempty" db:"state"`
-	Postcode           sql.NullString `json:"postcode,omitempty" db:"postcode"`
-	SSMDocumentURL     sql.NullString `json:"ssmDocumentUrl,omitempty" db:"ssm_document_url"`
-	BankStatementURL   sql.NullString `json:"bankStatementUrl,omitempty" db:"bank_statement_url"`
-	VerificationCode   sql.NullString `json:"-" db:"verification_code"`   // Hide from JSON
-	VerificationExpiry sql.NullTime   `json:"-" db:"verification_expiry"` // Hide from JSON
+	Version      int       `json:"-" db:"version"` // Also hide version from JSON
 }
 
 // Password is a helper struct for handling password operations.

@@ -16,11 +16,6 @@ import (
 	"github.com/01moynul/taptosell-golang/internal/email" // Our new email package
 )
 
-// ... (your import block)
-
-// TODO: Load this from a .env file or configuration manager
-const supplierRegistrationKey = "A_VERY_SECRET_KEY_REPLACE_LATER"
-
 // Handlers struct holds our database connection pool
 type Handlers struct {
 	DB *sql.DB
@@ -96,7 +91,8 @@ func (h *Handlers) RegisterDropshipper(c *gin.Context) {
 	// The query is now much longer to include the new fields
 	query := `
 		INSERT INTO users
-		(role, status, email, password_hash, full_name, phone_number, created_at, updated_at, version, verification_code, verification_expiry)
+		(role, status, email, password_hash, full_name, phone_number, created_at, updated_at, version,
+		 verification_code, verification_expiry)
 		VALUES
 		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
@@ -148,6 +144,7 @@ func (h *Handlers) RegisterDropshipper(c *gin.Context) {
 // RegisterSupplier is the handler for the supplier registration endpoint.
 func (h *Handlers) RegisterSupplier(c *gin.Context) {
 	// 1. --- Define Input ---
+	// We can reuse the same input struct, as the fields are identical.
 	var input RegisterUserInput
 
 	// 2. --- Bind & Validate JSON ---
@@ -156,48 +153,20 @@ func (h *Handlers) RegisterSupplier(c *gin.Context) {
 		return
 	}
 
-	// 3. --- VALIDATE REGISTRATION KEY ---
-	// From our blueprint, supplier registration is protected.
-	if input.RegistrationKey != supplierRegistrationKey {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Invalid registration key"})
-		return
-	}
-
-	// 4. --- Generate Verification Code ---
-	code, err := generateVerificationCode()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate verification code"})
-		return
-	}
-	expiry := time.Now().Add(15 * time.Minute) // Code expires in 15 minutes
-
-	// 5. --- Create User Model ---
+	// 3. --- Create User Model ---
+	// This is the main difference:
 	user := &models.User{
-		Role:        "supplier",
-		Status:      "unverified", // <-- CHANGED: New users are 'unverified'
+		Role:        "supplier", // Set the role to 'supplier'
+		Status:      "pending",  // Suppliers also start as 'pending' [cite: 8, 66]
 		Email:       input.Email,
 		FullName:    input.FullName,
 		PhoneNumber: input.PhoneNumber,
 		CreatedAt:   time.Now(),
 		UpdatedAt:   time.Now(),
 		Version:     1,
-		// --- Set verification fields ---
-		VerificationCode:   sql.NullString{String: code, Valid: true},
-		VerificationExpiry: sql.NullTime{Time: expiry, Valid: true},
-		// --- Set new supplier-specific fields ---
-		// We must convert our simple strings into 'sql.NullString'
-		CompanyName:  sql.NullString{String: input.CompanyName, Valid: input.CompanyName != ""},
-		ICNumber:     sql.NullString{String: input.ICNumber, Valid: input.ICNumber != ""},
-		SSMNumber:    sql.NullString{String: input.SSMNumber, Valid: input.SSMNumber != ""},
-		AddressLine1: sql.NullString{String: input.AddressLine1, Valid: input.AddressLine1 != ""},
-		AddressLine2: sql.NullString{String: input.AddressLine2, Valid: input.AddressLine2 != ""},
-		City:         sql.NullString{String: input.City, Valid: input.City != ""},
-		State:        sql.NullString{String: input.State, Valid: input.State != ""},
-		Postcode:     sql.NullString{String: input.Postcode, Valid: input.Postcode != ""},
 	}
-	// Note: ssm_document_url and bank_statement_url will be set in Phase 3.6
 
-	// 6. --- Hash the Password ---
+	// 4. --- Hash the Password ---
 	var password models.Password
 	if err := password.Set(input.Password); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
@@ -205,15 +174,13 @@ func (h *Handlers) RegisterSupplier(c *gin.Context) {
 	}
 	user.PasswordHash = password.Hash
 
-	// 7. --- Save to Database ---
-	// This query is now massive and includes all new fields.
+	// 5. --- Save to Database ---
+	// The query is identical.
 	query := `
 		INSERT INTO users
-		(role, status, email, password_hash, full_name, phone_number, created_at, updated_at, version,
-		verification_code, verification_expiry,
-		company_name, ic_number, ssm_number, address_line1, address_line2, city, state, postcode)
+		(role, status, email, password_hash, full_name, phone_number, created_at, updated_at, version)
 		VALUES
-		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		(?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	args := []interface{}{
 		user.Role,
@@ -225,16 +192,6 @@ func (h *Handlers) RegisterSupplier(c *gin.Context) {
 		user.CreatedAt,
 		user.UpdatedAt,
 		user.Version,
-		user.VerificationCode,
-		user.VerificationExpiry,
-		user.CompanyName,
-		user.ICNumber,
-		user.SSMNumber,
-		user.AddressLine1,
-		user.AddressLine2,
-		user.City,
-		user.State,
-		user.Postcode,
 	}
 
 	result, err := h.DB.Exec(query, args...)
@@ -250,15 +207,9 @@ func (h *Handlers) RegisterSupplier(c *gin.Context) {
 	}
 	user.ID = id
 
-	// 8. --- Send Verification Email ---
-	err = email.SendVerificationEmail(user.Email, code)
-	if err != nil {
-		log.Printf("ERROR: Failed to send verification email to %s: %v\n", user.Email, err)
-	}
-
-	// 9. --- Send Success Response ---
+	// 6. --- Send Success Response ---
 	c.JSON(http.StatusCreated, gin.H{
-		"message": "Supplier registration successful. Please check your email for a verification code.",
+		"message": "Supplier registered successfully, pending approval.",
 		"user":    user,
 	})
 }
@@ -283,9 +234,12 @@ func (h *Handlers) Login(c *gin.Context) {
 	}
 
 	// 3. --- Find User By Email ---
+	// We create an empty 'user' model to fill with data
 	var user models.User
 	query := "SELECT id, password_hash, role, status FROM users WHERE email = ?"
 
+	// 'h.DB.QueryRow' fetches a single row. We 'Scan' the results
+	// into the memory addresses of our 'user' struct fields.
 	err := h.DB.QueryRow(query, input.Email).Scan(
 		&user.ID,
 		&user.PasswordHash,
@@ -294,50 +248,43 @@ func (h *Handlers) Login(c *gin.Context) {
 	)
 
 	if err != nil {
+		// 'sql.ErrNoRows' means the email was not found.
 		if err == sql.ErrNoRows {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 			return
 		}
+		// Other database error
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
 		return
 	}
 
-	// 4. --- CHECK USER STATUS (NEW) ---
-	// We now block logins based on the new status ENUM
-	switch user.Status {
-	case "unverified":
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Account not verified. Please check your email for a verification code."})
-		return
-	case "pending":
-		c.JSON(http.StatusForbidden, gin.H{"error": "Your account is pending approval by an administrator."})
-		return
-	case "suspended":
-		c.JSON(http.StatusForbidden, gin.H{"error": "Your account has been suspended. Please contact support."})
-		return
-	case "active":
-		// User is active, continue to password check
-		break
-	default:
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Unknown user status"})
+	// 4. --- Check User Status ---
+	// According to our blueprint, 'pending' users can't log in.
+	if user.Status == "pending" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Account pending approval"})
 		return
 	}
 
 	// 5. --- Check Password ---
-	// This code now only runs if the user is 'active'
+	// Use the 'Matches' function from our 'user_types.go'
 	var password models.Password
-	password.Hash = user.PasswordHash
+	password.Hash = user.PasswordHash // Get the hash from the DB
 
 	match, err := password.Matches(input.Password)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check password"})
 		return
 	}
+	// If 'match' is false, the passwords did not match.
 	if !match {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
 
 	// 6. --- Generate JWT (The "Passport") ---
+	// We import our new 'auth' package. You may need to add this
+	// to your 'import' block at the top of the file:
+	// "github.com/01moynul/taptosell-golang/internal/auth"
 	token, err := auth.GenerateToken(user.ID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
@@ -345,6 +292,7 @@ func (h *Handlers) Login(c *gin.Context) {
 	}
 
 	// 7. --- Send Success Response ---
+	// We send back the token (passport) and basic user info.
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Login successful",
 		"token":   token,
