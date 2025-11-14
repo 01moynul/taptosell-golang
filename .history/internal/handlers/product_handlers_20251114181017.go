@@ -674,10 +674,6 @@ func (h *Handlers) SearchProducts(c *gin.Context) {
 			&product.Status,
 			&product.CreatedAt,
 			&product.UpdatedAt,
-			&product.Weight,
-			&product.PkgLength,
-			&product.PkgWidth,
-			&product.PkgHeight,
 		); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to scan product row"})
 			return

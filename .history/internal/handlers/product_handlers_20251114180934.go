@@ -602,8 +602,7 @@ func (h *Handlers) SearchProducts(c *gin.Context) {
 		SELECT DISTINCT
 			p.id, p.supplier_id, p.sku, p.name, p.description,
 			p.price, p.stock, p.is_variable, p.status,
-			p.created_at, p.updated_at,
-			p.weight, p.pkg_length, p.pkg_width, p.pkg_height
+			p.created_at, p.updated_at
 		FROM products p
 	`)
 
@@ -674,10 +673,6 @@ func (h *Handlers) SearchProducts(c *gin.Context) {
 			&product.Status,
 			&product.CreatedAt,
 			&product.UpdatedAt,
-			&product.Weight,
-			&product.PkgLength,
-			&product.PkgWidth,
-			&product.PkgHeight,
 		); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to scan product row"})
 			return

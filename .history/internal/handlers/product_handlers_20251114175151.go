@@ -58,10 +58,6 @@ type CreateProductInput struct {
 	// Only one of these will be populated based on 'isVariable'
 	SimpleProduct *SimpleProductInput `json:"simpleProduct,omitempty"`
 	Variants      []VariantInput      `json:"variants,omitempty"`
-
-	// --- NEW SHIPPING FIELDS ---
-	Weight            *float64                `json:"weight" binding:"omitempty,gt=0"`
-	PackageDimensions *PackageDimensionsInput `json:"packageDimensions,omitempty"`
 }
 
 // (We will add the CreateProduct handler function here next)
@@ -142,32 +138,16 @@ func (h *Handlers) CreateProduct(c *gin.Context) {
 		product.Stock = input.SimpleProduct.Stock
 		product.SKU = sql.NullString{String: input.SimpleProduct.SKU, Valid: input.SimpleProduct.SKU != ""}
 	}
-	// Handle nullable shipping fields
-	var weight sql.NullFloat64
-	var pkgLength sql.NullFloat64
-	var pkgWidth sql.NullFloat64
-	var pkgHeight sql.NullFloat64
-
-	if input.Weight != nil {
-		weight = sql.NullFloat64{Float64: *input.Weight, Valid: true}
-	}
-
-	if input.PackageDimensions != nil {
-		pkgLength = sql.NullFloat64{Float64: input.PackageDimensions.Length, Valid: true}
-		pkgWidth = sql.NullFloat64{Float64: input.PackageDimensions.Width, Valid: true}
-		pkgHeight = sql.NullFloat64{Float64: input.PackageDimensions.Height, Valid: true}
-	}
 
 	productQuery := `
 		INSERT INTO products
-		(supplier_id, name, description, price, stock, sku, is_variable, status, created_at, updated_at, weight, pkg_length, pkg_width, pkg_height)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		(supplier_id, name, description, price, stock, sku, is_variable, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	result, err := tx.Exec(productQuery,
 		product.SupplierID, product.Name, product.Description,
 		product.Price, product.Stock, product.SKU,
 		product.IsVariable, product.Status, product.CreatedAt, product.UpdatedAt,
-		weight, pkgLength, pkgWidth, pkgHeight,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to insert product"})
@@ -292,9 +272,7 @@ func (h *Handlers) GetMyProducts(c *gin.Context) {
 	statusFilter := c.Query("status")
 
 	query := `
-		SELECT 
-			id, supplier_id, sku, name, description, price, stock, is_variable, status, created_at, updated_at,
-			weight, pkg_length, pkg_width, pkg_height
+		SELECT id, supplier_id, sku, name, description, price, stock, is_variable, status, created_at, updated_at
 		FROM products
 		WHERE supplier_id = ?`
 
@@ -335,10 +313,6 @@ func (h *Handlers) GetMyProducts(c *gin.Context) {
 			&product.Status,
 			&product.CreatedAt,
 			&product.UpdatedAt,
-			&product.Weight,
-			&product.PkgLength,
-			&product.PkgWidth,
-			&product.PkgHeight,
 		); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to scan product row"})
 			return
@@ -381,12 +355,6 @@ type UpdateProductInput struct {
 	// Updating variants is complex, so we'll stub it for now.
 	// For a simple product, they can update these:
 	SimpleProduct *SimpleProductInput `json:"simpleProduct,omitempty"`
-	// For variable products, we will handle variant updates later.
-	Variants []VariantInput `json:"variants,omitempty"`
-
-	// --- NEW SHIPPING FIELDS ---
-	Weight            *float64                `json:"weight" binding:"omitempty,gt=0"`
-	PackageDimensions *PackageDimensionsInput `json:"packageDimensions,omitempty"`
 }
 
 // UpdateProduct is the handler for PUT /v1/products/:id
@@ -450,14 +418,6 @@ func (h *Handlers) UpdateProduct(c *gin.Context) {
 	if input.SimpleProduct != nil {
 		querySet += ", price = ?, stock = ?, sku = ?"
 		queryArgs = append(queryArgs, input.SimpleProduct.Price, input.SimpleProduct.Stock, input.SimpleProduct.SKU)
-	}
-	if input.Weight != nil {
-		querySet += ", weight = ?"
-		queryArgs = append(queryArgs, *input.Weight)
-	}
-	if input.PackageDimensions != nil {
-		querySet += ", pkg_length = ?, pkg_width = ?, pkg_height = ?"
-		queryArgs = append(queryArgs, input.PackageDimensions.Length, input.PackageDimensions.Width, input.PackageDimensions.Height)
 	}
 
 	// Add the product ID for the WHERE clause
@@ -602,8 +562,7 @@ func (h *Handlers) SearchProducts(c *gin.Context) {
 		SELECT DISTINCT
 			p.id, p.supplier_id, p.sku, p.name, p.description,
 			p.price, p.stock, p.is_variable, p.status,
-			p.created_at, p.updated_at,
-			p.weight, p.pkg_length, p.pkg_width, p.pkg_height
+			p.created_at, p.updated_at
 		FROM products p
 	`)
 
@@ -674,10 +633,6 @@ func (h *Handlers) SearchProducts(c *gin.Context) {
 			&product.Status,
 			&product.CreatedAt,
 			&product.UpdatedAt,
-			&product.Weight,
-			&product.PkgLength,
-			&product.PkgWidth,
-			&product.PkgHeight,
 		); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to scan product row"})
 			return
