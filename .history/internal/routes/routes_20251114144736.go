@@ -61,8 +61,6 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 			// --- NEW PRODUCT ROUTE ---
 			auth.POST("/products", h.CreateProduct)
 			auth.GET("/products/supplier/me", h.GetMyProducts)
-			auth.PUT("/products/:id", h.UpdateProduct)
-			auth.DELETE("/products/:id", h.DeleteProduct)
 		}
 	}
 
