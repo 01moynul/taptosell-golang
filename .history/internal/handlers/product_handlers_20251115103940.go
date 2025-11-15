@@ -47,10 +47,11 @@ type CreateProductInput struct {
 	Status      string `json:"status" binding:"required,oneof=draft private_inventory pending"`
 
 	// --- Relational Data ---
-	BrandName string `json:"brandName"`
-	BrandID   *int64 `json:"brandId"`
+	// We accept a *new* brand name (string) or an *existing* brand ID (int64)
+	BrandName string `json:"brandName"` // For creating a new brand "on-the-fly"
+	BrandID   *int64 `json:"brandId"`   // For linking an existing brand
 
-	// --- Relational Data ---
+	// We accept an array of *existing* category IDs
 	CategoryIDs []int64 `json:"categoryIds" binding:"required,min=1"`
 
 	// --- Simple vs. Variable Logic ---
@@ -71,6 +72,7 @@ type CreateProductInput struct {
 // CreateProduct is the handler for POST /v1/products
 func (h *Handlers) CreateProduct(c *gin.Context) {
 	// 1. --- Get Supplier ID ---
+	// We get the userID from the AuthMiddleware context
 	userID_raw, exists := c.Get("userID")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User ID not found in context"})
@@ -91,21 +93,28 @@ func (h *Handlers) CreateProduct(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Variable product must have at least one variant"})
 			return
 		}
+		// Clear simple product data just in case
 		input.SimpleProduct = nil
 	} else {
 		if input.SimpleProduct == nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Simple product must have simpleProduct data"})
 			return
 		}
+		// Clear variant data just in case
 		input.Variants = nil
 	}
 
 	// 4. --- Begin Database Transaction ---
+	// Product creation is complex (multiple tables). A transaction ensures
+	// that if one part fails (e.g., linking a category), the entire
+	// operation is rolled back, preventing orphaned data.
 	tx, err := h.DB.Begin()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start database transaction"})
 		return
 	}
+	// 'defer tx.Rollback()' is a safety net. If we return anywhere
+	// *without* tx.Commit(), this will automatically cancel the transaction.
 	defer tx.Rollback()
 
 	// 5. --- Handle Brand (Get or Create) ---
@@ -116,6 +125,8 @@ func (h *Handlers) CreateProduct(c *gin.Context) {
 	}
 
 	// 6. --- Create the Core Product ---
+	// For now, we are saving the *main* product.
+	// We will handle variants in a future step.
 	product := &models.Product{
 		SupplierID:  supplierID,
 		Name:        input.Name,
@@ -126,8 +137,7 @@ func (h *Handlers) CreateProduct(c *gin.Context) {
 		UpdatedAt:   time.Now(),
 	}
 
-	// Handle Commission (nullable)
-	var commissionRate sql.NullFloat64
+	// If it's a simple product, save its price/sku/stock on the main record
 	if !input.IsVariable {
 		// Simple Product: Use commission from simpleProduct object
 		product.PriceToTTS = input.SimpleProduct.Price
@@ -189,6 +199,8 @@ func (h *Handlers) CreateProduct(c *gin.Context) {
 	product.ID = productID
 
 	// 7. --- Link Categories ---
+	// We loop through the array of category IDs and insert each link
+	// into the 'product_categories' junction table.
 	categoryQuery := `INSERT INTO product_categories (product_id, category_id) VALUES (?, ?)`
 	for _, catID := range input.CategoryIDs {
 		_, err := tx.Exec(categoryQuery, productID, catID)
@@ -228,7 +240,8 @@ func (h *Handlers) CreateProduct(c *gin.Context) {
 	})
 }
 
-// getOrCreateBrandID (No changes needed in this helper)
+// getOrCreateBrandID is a helper function to find an existing brand
+// or create a new one "on-the-fly" within the transaction.
 func (h *Handlers) getOrCreateBrandID(tx *sql.Tx, brandID *int64, brandName string) (int64, error) {
 	// Case 1: An existing BrandID was provided.
 	if brandID != nil {
