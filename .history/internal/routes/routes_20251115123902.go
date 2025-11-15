@@ -105,9 +105,6 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 			// Settings Routes
 			manager.GET("/settings", h.GetSettings)
 			manager.PATCH("/settings", h.UpdateSettings)
-
-			// User Subscription Management Routes
-			manager.POST("/users/:id/subscription", h.AssignSubscription)
 		}
 
 		// --- Dropshipper-Only Routes (Login + Role Required) ---

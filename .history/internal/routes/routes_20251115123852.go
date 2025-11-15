@@ -40,7 +40,7 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 		v1.POST("/brands", h.CreateBrand)
 		v1.GET("/brands", h.GetAllBrands)
 
-		// --- Public Subscription Routes ---
+		// --- NEW: Public Subscription Routes ---
 		v1.GET("/subscriptions/plans", h.GetSubscriptionPlans)
 
 		// --- Protected Routes (Login Required) ---
@@ -105,9 +105,6 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 			// Settings Routes
 			manager.GET("/settings", h.GetSettings)
 			manager.PATCH("/settings", h.UpdateSettings)
-
-			// User Subscription Management Routes
-			manager.POST("/users/:id/subscription", h.AssignSubscription)
 		}
 
 		// --- Dropshipper-Only Routes (Login + Role Required) ---
