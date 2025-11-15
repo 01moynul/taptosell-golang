@@ -433,19 +433,6 @@ func (h *Handlers) UpdateProduct(c *gin.Context) {
 	}
 	defer tx.Rollback() // Safety net
 
-	// 4.5 --- Price Change Validation (NEW) ---
-	// As per roadmap task 5.3, we must prevent price changes
-	// on 'published' products via this handler.
-	if currentProduct.Status == "published" && input.SimpleProduct != nil {
-		// Check if the price is different
-		if input.SimpleProduct.Price != currentProduct.Price {
-			c.JSON(http.StatusForbidden, gin.H{
-				"error": "You cannot change the price of a 'published' product. Please use the 'Request Price Change' feature.",
-			})
-			return // Stop the update
-		}
-	}
-
 	// 5. --- Dynamically Build UPDATE Query ---
 	// We build the "SET" part of the query and the arguments list
 	// based *only* on the fields the user provided (non-nil fields).

@@ -94,10 +94,6 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 			// Withdrawal Approval Routes
 			manager.GET("/withdrawal-requests", h.GetWithdrawalRequests)
 			manager.PATCH("/withdrawal-requests/:id", h.ProcessWithdrawalRequest)
-
-			// Price Appeal Routes
-			manager.GET("/price-requests", h.GetPriceAppeals)
-			manager.PATCH("/price-requests/:id", h.ProcessPriceAppeal)
 		}
 
 		// --- Dropshipper-Only Routes (Login + Role Required) ---
