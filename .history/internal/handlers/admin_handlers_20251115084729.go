@@ -156,29 +156,9 @@ func (h *Handlers) RejectProduct(c *gin.Context) {
 		return
 	}
 
-	// 2. --- Begin Transaction ---
-	tx, err := h.DB.Begin()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction"})
-		return
-	}
-	defer tx.Rollback()
-
-	// 3. --- Get Product Info (and lock the row) ---
-	var supplierID int64
-	var productName string
-	err = tx.QueryRow("SELECT supplier_id, name FROM products WHERE id = ? AND status = 'pending' FOR UPDATE", productIDStr).Scan(&supplierID, &productName)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			c.JSON(http.StatusNotFound, gin.H{"error": "Product not found or was not pending approval"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get product details"})
-		return
-	}
-
-	// 4. --- Update Database ---
-	// TODO: Save the input.Reason to a 'rejection_reason' column.
+	// 2. --- Update Database ---
+	// We'll store the rejection reason in a future 'rejection_reason'
+	// column. For now, we just update the status.
 	query := `
 		UPDATE products
 		SET status = ?, updated_at = ?
@@ -186,26 +166,24 @@ func (h *Handlers) RejectProduct(c *gin.Context) {
 
 	args := []interface{}{"rejected", time.Now(), productIDStr, "pending"}
 
-	_, err = tx.Exec(query, args...)
+	result, err := h.DB.Exec(query, args...)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reject product"})
 		return
 	}
 
-	// 5. --- Add Notification (NEW STEP) ---
-	message := fmt.Sprintf("Your product \"%s\" was rejected. Reason: %s", productName, input.Reason)
-	link := fmt.Sprintf("/supplier/products/%s", productIDStr) // A future frontend link
-
-	if err := h.AddNotification(tx, supplierID, message, link); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to send notification"})
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check affected rows"})
+		return
+	}
+	if rowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Product not found or was not pending approval"})
 		return
 	}
 
-	// 6. --- Commit Transaction ---
-	if err := tx.Commit(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
-		return
-	}
+	// TODO: Save the input.Reason to a 'rejection_reason' column.
+	// TODO: Send a notification to the supplier with the input.Reason.
 
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Product rejected successfully",
