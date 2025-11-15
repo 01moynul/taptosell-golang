@@ -87,10 +87,6 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 			manager.GET("/products/pending", h.GetPendingProducts)
 			manager.PATCH("/products/:id/approve", h.ApproveProduct)
 			manager.PATCH("/products/:id/reject", h.RejectProduct)
-
-			// Withdrawal Approval Routes
-			manager.GET("/withdrawal-requests", h.GetWithdrawalRequests)
-			manager.PATCH("/withdrawal-requests/:id", h.ProcessWithdrawalRequest)
 		}
 
 		// --- Dropshipper-Only Routes (Login + Role Required) ---
