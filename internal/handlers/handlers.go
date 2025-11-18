@@ -1,10 +1,14 @@
 package handlers
 
-import "database/sql"
+import (
+	"database/sql"
 
-// Handlers struct holds all dependencies for our handlers,
-// such as the database connection pool(s).
+	"github.com/01moynul/taptosell-golang/internal/ai" // ADDED: Import AI package
+)
+
+// Handlers struct holds all dependencies for our handlers.
 type Handlers struct {
-	DB         *sql.DB // Primary Read/Write connection
-	DBReadOnly *sql.DB // ADDED: Read-Only connection for AI and sensitive reads
+	DB         *sql.DB       // Primary Read/Write connection
+	DBReadOnly *sql.DB       // Read-Only connection
+	AIService  *ai.AIService // ADDED: The new AI service instance for core AI logic
 }
