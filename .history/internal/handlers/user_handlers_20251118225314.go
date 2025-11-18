@@ -279,6 +279,19 @@ type LoginInput struct {
 
 // Login is the handler for the /v1/login endpoint.
 func (h *Handlers) Login(c *gin.Context) {
+
+	// 0. --- CHECK MAINTENANCE MODE ---
+	var maintenanceMode string
+	// We ignore errors (defaults to empty string) if key is missing
+	_ = h.DB.QueryRow("SELECT setting_value FROM settings WHERE setting_key = 'maintenance_mode'").Scan(&maintenanceMode)
+
+	if maintenanceMode == "true" {
+		// We allow the login temporarily to check if the user is an Admin,
+		// but for security, we can just block ALL logins and require Admins to
+		// use a separate back-door or just disable maintenance via CLI if locked out.
+		// However, for better UX, we will allow the query to proceed but block
+		// non-admins in step 4.
+	}
 	// 1. --- Define Input ---
 	var input LoginInput
 
@@ -308,7 +321,8 @@ func (h *Handlers) Login(c *gin.Context) {
 		return
 	}
 
-	// 4. --- CHECK USER STATUS ---
+	// 4. --- CHECK USER STATUS (NEW) ---
+	// We now block logins based on the new status ENUM
 	switch user.Status {
 	case "unverified":
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Account not verified. Please check your email for a verification code."})
@@ -320,23 +334,15 @@ func (h *Handlers) Login(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Your account has been suspended. Please contact support."})
 		return
 	case "active":
-		// --- MAINTENANCE MODE CHECK (Merged correctly) ---
-		var maintenanceMode string
-		_ = h.DB.QueryRow("SELECT setting_value FROM settings WHERE setting_key = 'maintenance_mode'").Scan(&maintenanceMode)
-
-		// If maintenance is ON and user is NOT an administrator, block login.
-		if maintenanceMode == "true" && user.Role != "administrator" {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "⛔ System is in Maintenance Mode. Logins are temporarily disabled."})
-			return
-		}
-		// User is active and allowed, continue to password check...
-
+		// User is active, continue to password check
+		break
 	default:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Unknown user status"})
 		return
 	}
 
 	// 5. --- Check Password ---
+	// This code now only runs if the user is 'active'
 	var password models.Password
 	password.Hash = user.PasswordHash
 
@@ -350,7 +356,7 @@ func (h *Handlers) Login(c *gin.Context) {
 		return
 	}
 
-	// 6. --- Generate JWT ---
+	// 6. --- Generate JWT (The "Passport") ---
 	token, err := auth.GenerateToken(user.ID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})

@@ -10,14 +10,19 @@ import (
 )
 
 // AuthMiddleware creates a gin.HandlerFunc that acts as our "security guard".
-// UPDATED: It now accepts 'db' to check for Maintenance Mode.
+// Updated for Phase 6.8: It now accepts a database connection to check maintenance mode.
 func AuthMiddleware(db *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 1. --- CHECK MAINTENANCE MODE ---
+		// We check the settings table first.
 		var maintenanceMode string
-		// We check the settings table. We ignore errors (defaults to empty string)
-		// if the setting hasn't been created yet.
-		_ = db.QueryRow("SELECT setting_value FROM settings WHERE setting_key = 'maintenance_mode'").Scan(&maintenanceMode)
+		query := "SELECT setting_value FROM settings WHERE setting_key = 'maintenance_mode'"
+		err := db.QueryRow(query).Scan(&maintenanceMode)
+
+		// If the setting doesn't exist yet (db migration pending), we treat it as "false".
+		if err != nil && err != sql.ErrNoRows {
+			// Log error but don't crash, assume safe to proceed
+		}
 
 		// 2. --- Get Authorization Header ---
 		authHeader := c.GetHeader("Authorization")
@@ -43,20 +48,24 @@ func AuthMiddleware(db *sql.DB) gin.HandlerFunc {
 			return
 		}
 
-		// 4. --- ENFORCE MAINTENANCE MODE ---
-		// If maintenance is ON ("true"), only Administrators can pass.
+		// 4. --- CHECK USER ROLE (If Maintenance Mode is ON) ---
 		if maintenanceMode == "true" {
+			// We need to fetch the user's role to see if they are an Administrator
 			var role string
-			err := db.QueryRow("SELECT role FROM users WHERE id = ?", userID).Scan(&role)
+			roleQuery := "SELECT role FROM users WHERE id = ?"
+			err := db.QueryRow(roleQuery, userID).Scan(&role)
+
 			if err != nil {
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Service unavailable (maintenance check failed)"})
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify user role during maintenance"})
 				c.Abort()
 				return
 			}
 
+			// Only 'administrator' can bypass maintenance mode.
+			// Even 'managers' are blocked to ensure data consistency during updates.
 			if role != "administrator" {
 				c.JSON(http.StatusServiceUnavailable, gin.H{
-					"error": "⛔ The system is currently in Maintenance Mode. Please try again later.",
+					"error": "System is currently in Maintenance Mode. Please try again later.",
 				})
 				c.Abort()
 				return

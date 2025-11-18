@@ -330,6 +330,7 @@ func (h *Handlers) Login(c *gin.Context) {
 			return
 		}
 		// User is active and allowed, continue to password check...
+		break
 
 	default:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Unknown user status"})
