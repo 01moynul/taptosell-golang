@@ -52,15 +52,17 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 		{
 			// Add a new test route: GET /v1/profile/me
 			auth.GET("/profile/me", func(c *gin.Context) {
-				// We can now get the 'userID' that the middleware set.
 				userID, _ := c.Get("userID")
-
 				c.JSON(http.StatusOK, gin.H{
 					"message":    "This is a protected route",
 					"yourUserID": userID,
 				})
-
 			})
+
+			// --- AI Chat Route (NEW) ---
+			// Available to all logged-in users.
+			// The handler determines behavior based on the user's role.
+			auth.POST("/ai/chat", h.ChatAI)
 
 			// --- Notification Routes ---
 			auth.GET("/notifications", h.GetMyNotifications)

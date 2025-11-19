@@ -4,19 +4,16 @@ import (
 	"log"
 	"os"
 
+	"github.com/01moynul/taptosell-golang/internal/ai" // ADDED: Import AI package
 	"github.com/01moynul/taptosell-golang/internal/database"
 	"github.com/01moynul/taptosell-golang/internal/handlers"
 	"github.com/01moynul/taptosell-golang/internal/routes"
-	"github.com/joho/godotenv" // ADDED: Package to load .env file
+	"github.com/joho/godotenv"
 )
 
 func main() {
 	// 0. --- Load Environment Variables (.env) ---
-	// If the .env file exists in the root, this loads all key/value pairs
-	// into the process environment (os.Getenv()).
 	if err := godotenv.Load(); err != nil {
-		// Log a warning if the file is missing, but don't crash,
-		// as production might rely on injected environment variables.
 		log.Println("WARNING: Could not find or load .env file. Relying on system environment variables.")
 	}
 
@@ -28,24 +25,39 @@ func main() {
 	defer db.Close()
 
 	// 2. --- AI Database Connection (Read-Only) ---
-	// This uses the restricted 'taptosell_ai_readonly' user.
 	readOnlyDSN := os.Getenv("DB_DSN_READONLY")
 	if readOnlyDSN == "" {
 		log.Fatalf("CRITICAL ERROR: DB_DSN_READONLY environment variable is not set. Cannot run AI components.")
 	}
 
-	// We create a separate, isolated connection pool for security
 	dbReadOnly, err := database.OpenDBWithDSN(readOnlyDSN)
 	if err != nil {
 		log.Fatalf("CRITICAL ERROR: Failed to connect to AI read-only database: %v", err)
 	}
 	defer dbReadOnly.Close()
 
+	// 3. --- AI Service Initialization ---
+	// CORRECTED: Use the NAME of the variable, not the value.
+	geminiKey := os.Getenv("GEMINI_API_KEY")
+	if geminiKey == "" {
+		log.Fatal("CRITICAL ERROR: GEMINI_API_KEY environment variable is not set.")
+	}
+
+	// FIX: Pass both geminiKey AND dbReadOnly
+	aiService, err := ai.NewAIService(geminiKey, dbReadOnly)
+	if err != nil {
+		log.Fatalf("Failed to initialize AI Service: %v", err)
+	}
+
+	// Note: Depending on implementation, we might defer closing the client here.
+	// e.g., defer aiService.Client.Close()
+
 	// --- Application Setup ---
-	// We inject BOTH connections into the Handlers struct.
+	// We inject ALL dependencies (DBs and AI Service) into the Handlers struct.
 	app := &handlers.Handlers{
 		DB:         db,         // Primary Read/Write connection
-		DBReadOnly: dbReadOnly, // New Read-Only connection for AI security
+		DBReadOnly: dbReadOnly, // Read-Only connection for AI security
+		AIService:  aiService,  // ADDED: Injected AI Service
 	}
 
 	// --- Router Setup ---
@@ -57,6 +69,3 @@ func main() {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 }
-
-// Note: database.OpenDBWithDSN is assumed to be defined in internal/database/database.go
-// and will be created in the next step.
