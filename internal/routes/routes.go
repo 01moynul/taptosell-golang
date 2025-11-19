@@ -106,6 +106,10 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 				supplierInventory.POST("/brands", h.CreateInventoryBrand)
 				supplierInventory.GET("/brands", h.GetMyInventoryBrands)
 				// We can add PUT/DELETE for brands later if needed
+
+				// (Ideally near the other /supplier/wallet routes)
+				auth.GET("/supplier/dashboard-stats", h.GetSupplierStats)
+
 			}
 
 		}
@@ -135,6 +139,10 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 
 			// User Subscription Management Routes
 			manager.POST("/users/:id/subscription", h.AssignSubscription)
+
+			// 2. Add this to the 'manager' group
+			manager.GET("/dashboard-stats", h.GetManagerStats)
+
 		}
 
 		// --- Super Admin-Only Routes (Login + 'administrator' Role Required) ---
@@ -144,6 +152,8 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 		{
 			admin.POST("/create-manager", h.CreateManager)
 		}
+
+		// ... inside func SetupRouter ...
 
 		// --- Dropshipper-Only Routes (Login + Role Required) ---
 		// This group is for the 'dropshipper' role
@@ -162,6 +172,13 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 
 			// Checkout Route
 			dropshipper.POST("/checkout", h.Checkout)
+
+			// --- NEW: Order Routes ---
+			dropshipper.GET("/orders", h.GetMyOrders)         // List all orders
+			dropshipper.GET("/orders/:id", h.GetOrderDetails) // View single order
+
+			// 3. Add this to the 'dropshipper' group
+			dropshipper.GET("/dashboard-stats", h.GetDropshipperStats)
 		}
 	}
 

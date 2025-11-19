@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/01moynul/taptosell-golang/internal/models" // <-- Added this import
 	"github.com/gin-gonic/gin"
 )
 
@@ -14,7 +15,6 @@ import (
 //
 
 // CartItemData is a helper struct for fetching cart items during checkout
-// NO CHANGE: Internal struct names are fine.
 type CartItemData struct {
 	ProductID int64
 	Quantity  int
@@ -49,14 +49,13 @@ func (h *Handlers) Checkout(c *gin.Context) {
 	}
 
 	// Get all items in the cart AND *lock* the product rows for this transaction
-	// UPDATED: Query selects p.price_to_tts and p.stock_quantity
 	query := `
 		SELECT ci.product_id, ci.quantity, p.price_to_tts, p.stock_quantity
 		FROM cart_items ci
 		JOIN products p ON ci.product_id = p.id
 		WHERE ci.cart_id = ? AND p.status = 'published'
 		FOR UPDATE
-	` // 'FOR UPDATE' locks the selected 'products' rows
+	`
 
 	rows, err := tx.Query(query, cartID)
 	if err != nil {
@@ -70,14 +69,12 @@ func (h *Handlers) Checkout(c *gin.Context) {
 
 	for rows.Next() {
 		var item CartItemData
-		// UPDATED: Scan order is correct, scans new cols into struct fields
 		if err := rows.Scan(&item.ProductID, &item.Quantity, &item.Price, &item.Stock); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to scan cart item"})
 			return
 		}
 
 		// 4. --- Check Stock & Calculate Total ---
-		// NO CHANGE: Logic is correct, 'item.Stock' now holds 'stock_quantity'
 		if item.Stock < item.Quantity {
 			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Not enough stock for product ID %d", item.ProductID)})
 			return
@@ -92,7 +89,6 @@ func (h *Handlers) Checkout(c *gin.Context) {
 	}
 
 	// 5. --- Check Wallet Balance ---
-	// NO CHANGE: This helper function is separate
 	var balance sql.NullFloat64
 	err = tx.QueryRow("SELECT SUM(amount) FROM wallet_transactions WHERE user_id = ?", dropshipperID).Scan(&balance)
 	if err != nil {
@@ -131,12 +127,10 @@ func (h *Handlers) Checkout(c *gin.Context) {
 		INSERT INTO order_items (order_id, product_id, quantity, unit_price, created_at)
 		VALUES (?, ?, ?, ?, ?)`
 
-	// UPDATED: Stock deduction query uses stock_quantity
 	stockQuery := "UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ?"
 
 	for _, item := range cartItems {
 		// a. Snapshot the item into order_items
-		// NO CHANGE: item.Price holds the correct 'price_to_tts'
 		_, err := tx.Exec(itemQuery, orderID, item.ProductID, item.Quantity, item.Price, now)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save order item"})
@@ -145,7 +139,6 @@ func (h *Handlers) Checkout(c *gin.Context) {
 
 		// b. If the order is paid, deduct stock
 		if orderStatus == "processing" {
-			// NO CHANGE: Logic is correct
 			_, err := tx.Exec(stockQuery, item.Quantity, item.ProductID)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to deduct stock"})
@@ -156,7 +149,6 @@ func (h *Handlers) Checkout(c *gin.Context) {
 
 	// c. If the order is paid, deduct from wallet
 	if orderStatus == "processing" {
-		// NO CHANGE: This helper function is separate
 		err = h.AddWalletTransaction(tx, dropshipperID, "order", -totalOrderCost, fmt.Sprintf("Payment for Order ID %d", orderID))
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to deduct from wallet"})
@@ -182,6 +174,133 @@ func (h *Handlers) Checkout(c *gin.Context) {
 		"message":   fmt.Sprintf("Order created successfully with status: %s", orderStatus),
 		"orderId":   orderID,
 		"status":    orderStatus,
-		"totalPaid": totalOrderCost, // This is the total cost to the dropshipper
+		"totalPaid": totalOrderCost,
+	})
+}
+
+//
+// --- NEW: Order Retrieval Handlers ---
+//
+
+// OrderItemDetail extends the base OrderItem to include Product info
+type OrderItemDetail struct {
+	models.OrderItem
+	ProductName string `json:"productName"`
+	ProductSKU  string `json:"productSku"`
+}
+
+// GetMyOrders is the handler for GET /v1/dropshipper/orders
+func (h *Handlers) GetMyOrders(c *gin.Context) {
+	// 1. --- Get Dropshipper ID ---
+	userID_raw, _ := c.Get("userID")
+	dropshipperID := userID_raw.(int64)
+
+	// 2. --- Query Orders ---
+	query := `
+		SELECT id, user_id, status, total, created_at, updated_at, tracking 
+		FROM orders 
+		WHERE user_id = ? 
+		ORDER BY created_at DESC
+	`
+
+	rows, err := h.DB.Query(query, dropshipperID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch orders"})
+		return
+	}
+	defer rows.Close()
+
+	// 3. --- Scan Rows ---
+	var orders []models.Order
+	for rows.Next() {
+		var o models.Order
+		var tracking sql.NullString
+
+		if err := rows.Scan(&o.ID, &o.UserID, &o.Status, &o.Total, &o.CreatedAt, &o.UpdatedAt, &tracking); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to scan order data"})
+			return
+		}
+		o.Tracking = tracking
+		orders = append(orders, o)
+	}
+
+	// 4. --- Return Response ---
+	if orders == nil {
+		orders = []models.Order{}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"orders": orders,
+	})
+}
+
+// GetOrderDetails is the handler for GET /v1/dropshipper/orders/:id
+func (h *Handlers) GetOrderDetails(c *gin.Context) {
+	// 1. --- Get IDs ---
+	userID_raw, _ := c.Get("userID")
+	dropshipperID := userID_raw.(int64)
+	orderID := c.Param("id")
+
+	// 2. --- Fetch Order & Verify Ownership ---
+	var o models.Order
+	var tracking sql.NullString
+
+	queryOrder := `
+		SELECT id, user_id, status, total, created_at, updated_at, tracking 
+		FROM orders 
+		WHERE id = ? AND user_id = ?
+	`
+	err := h.DB.QueryRow(queryOrder, orderID, dropshipperID).Scan(
+		&o.ID, &o.UserID, &o.Status, &o.Total, &o.CreatedAt, &o.UpdatedAt, &tracking,
+	)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Order not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch order"})
+		return
+	}
+	o.Tracking = tracking
+
+	// 3. --- Fetch Order Items with Product Details ---
+	queryItems := `
+		SELECT 
+			oi.id, oi.order_id, oi.product_id, oi.quantity, oi.unit_price, oi.created_at,
+			p.name, p.sku
+		FROM order_items oi
+		JOIN products p ON oi.product_id = p.id
+		WHERE oi.order_id = ?
+	`
+
+	rows, err := h.DB.Query(queryItems, o.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch order items"})
+		return
+	}
+	defer rows.Close()
+
+	var items []OrderItemDetail
+	for rows.Next() {
+		var item OrderItemDetail
+		if err := rows.Scan(
+			&item.ID, &item.OrderID, &item.ProductID, &item.Quantity, &item.UnitPrice, &item.CreatedAt,
+			&item.ProductName, &item.ProductSKU,
+		); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to scan order item"})
+			return
+		}
+		items = append(items, item)
+	}
+
+	// 4. --- Return Combined Response ---
+	if items == nil {
+		items = []OrderItemDetail{}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"order": o,
+		"items": items,
 	})
 }
