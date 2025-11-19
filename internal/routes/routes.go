@@ -1,21 +1,52 @@
 package routes
 
 import (
-	"net/http" // Add this
+	"net/http"
 
 	"github.com/01moynul/taptosell-golang/internal/handlers"
-	"github.com/01moynul/taptosell-golang/internal/middleware" // <-- ADD THIS IMPORT
+	"github.com/01moynul/taptosell-golang/internal/middleware"
 	"github.com/gin-gonic/gin"
 )
 
+// --- NEW: Secure CORS Middleware ---
+// This function tells the browser that it is safe for localhost:5173 to send data to us.
+func CORSMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// 1. Strictly allow ONLY your local React frontend
+		c.Writer.Header().Set("Access-Control-Allow-Origin", "http://localhost:5173")
+
+		// 2. Allow standard security credentials
+		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
+
+		// 3. Allow the headers we actually use (specifically "Authorization" for JWT tokens)
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
+
+		// 4. Allow the HTTP methods we use in our API
+		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE, PATCH")
+
+		// 5. Handle the "Preflight" OPTIONS request
+		// The browser sends this empty request first to check permissions. We must reply with "204 No Content".
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(204)
+			return
+		}
+
+		c.Next()
+	}
+}
+
 func SetupRouter(h *handlers.Handlers) *gin.Engine {
 	router := gin.Default()
+
+	// --- APPLY THE CORS GUARD ---
+	// This must be the very first thing the router uses
+	router.Use(CORSMiddleware())
 
 	v1 := router.Group("/v1")
 	{
 		// --- Ping Route (Public) ---
 		v1.GET("/ping", func(c *gin.Context) {
-			// ... (rest of ping code)
+			c.JSON(http.StatusOK, gin.H{"message": "pong!"})
 		})
 
 		// --- Auth Routes (Public) ---
@@ -31,12 +62,10 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 		v1.GET("/products/search", h.SearchProducts)
 
 		// --- Category Routes ---
-		// TODO: Add manager protection to POST
 		v1.POST("/categories", h.CreateCategory)
 		v1.GET("/categories", h.GetAllCategories)
 
 		// --- Brand Routes ---
-		// TODO: Add manager protection to POST
 		v1.POST("/brands", h.CreateBrand)
 		v1.GET("/brands", h.GetAllBrands)
 
@@ -44,13 +73,10 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 		v1.GET("/subscriptions/plans", h.GetSubscriptionPlans)
 
 		// --- Protected Routes (Login Required) ---
-		// We create a new group called 'auth'.
-		// .Use(middleware.AuthMiddleware()) applies our "security guard"
-		// to EVERY route defined inside this group.
 		auth := v1.Group("/")
-		auth.Use(middleware.AuthMiddleware(h.DB)) // <--- APPLY THE "GUARD"
+		auth.Use(middleware.AuthMiddleware(h.DB))
 		{
-			// Add a new test route: GET /v1/profile/me
+			// Test Route
 			auth.GET("/profile/me", func(c *gin.Context) {
 				userID, _ := c.Get("userID")
 				c.JSON(http.StatusOK, gin.H{
@@ -59,125 +85,93 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 				})
 			})
 
-			// --- AI Chat Route (NEW) ---
-			// Available to all logged-in users.
-			// The handler determines behavior based on the user's role.
+			// --- AI Chat Route ---
 			auth.POST("/ai/chat", h.ChatAI)
 
 			// --- Notification Routes ---
 			auth.GET("/notifications", h.GetMyNotifications)
 			auth.PATCH("/notifications/:id/read", h.MarkNotificationAsRead)
 
-			// --- NEW FILE UPLOAD ROUTE ---
+			// --- Supplier Documents ---
 			auth.POST("/supplier/documents", h.UploadSupplierDocuments)
 
-			// --- NEW PRODUCT ROUTE ---
+			// --- Product Routes ---
 			auth.POST("/products", h.CreateProduct)
 			auth.GET("/products/supplier/me", h.GetMyProducts)
 			auth.PUT("/products/:id", h.UpdateProduct)
 			auth.DELETE("/products/:id", h.DeleteProduct)
 
-			// --- Supplier Wallet Routes ---
+			// --- Supplier Wallet ---
 			auth.GET("/supplier/wallet", h.GetSupplierWallet)
 			auth.POST("/supplier/wallet/request-withdrawal", h.RequestWithdrawal)
 
-			// --- Price Appeal Route ---
+			// --- Price Appeal ---
 			auth.POST("/products/:id/request-price-change", h.RequestPriceChange)
 
-			// --- NEW: Supplier-Only Inventory Routes ---
-			// We can re-use the AuthMiddleware but will add a Supplier-specific check later
+			// --- Supplier Inventory ---
 			supplierInventory := auth.Group("/supplier/inventory")
 			{
-				// Item CRUD
 				supplierInventory.POST("/", h.CreateInventoryItem)
 				supplierInventory.GET("/", h.GetMyInventoryItems)
 				supplierInventory.PUT("/:id", h.UpdateInventoryItem)
 				supplierInventory.DELETE("/:id", h.DeleteInventoryItem)
-
-				// --- Promote Route ---
 				supplierInventory.POST("/:id/promote", h.PromoteInventoryItem)
-
-				// Category CRUD (Simplified)
 				supplierInventory.POST("/categories", h.CreateInventoryCategory)
 				supplierInventory.GET("/categories", h.GetMyInventoryCategories)
-				// We can add PUT/DELETE for categories later if needed
-
-				// Brand CRUD (Simplified)
 				supplierInventory.POST("/brands", h.CreateInventoryBrand)
 				supplierInventory.GET("/brands", h.GetMyInventoryBrands)
-				// We can add PUT/DELETE for brands later if needed
-
-				// (Ideally near the other /supplier/wallet routes)
-				auth.GET("/supplier/dashboard-stats", h.GetSupplierStats)
-
 			}
 
+			// Supplier Stats
+			auth.GET("/supplier/dashboard-stats", h.GetSupplierStats)
 		}
 
-		// --- Manager-Only Routes (Login + Role Required) ---
-		// This group is for 'manager' and 'administrator' roles
+		// --- Manager-Only Routes ---
 		manager := v1.Group("/manager")
-		manager.Use(middleware.AuthMiddleware(h.DB))    // 1. Must be logged in
-		manager.Use(middleware.ManagerMiddleware(h.DB)) // 2. Must be a Manager
+		manager.Use(middleware.AuthMiddleware(h.DB))
+		manager.Use(middleware.ManagerMiddleware(h.DB))
 		{
-			// Product Approval Routes
 			manager.GET("/products/pending", h.GetPendingProducts)
 			manager.PATCH("/products/:id/approve", h.ApproveProduct)
 			manager.PATCH("/products/:id/reject", h.RejectProduct)
 
-			// Withdrawal Approval Routes
 			manager.GET("/withdrawal-requests", h.GetWithdrawalRequests)
 			manager.PATCH("/withdrawal-requests/:id", h.ProcessWithdrawalRequest)
 
-			// Price Appeal Routes
 			manager.GET("/price-requests", h.GetPriceAppeals)
 			manager.PATCH("/price-requests/:id", h.ProcessPriceAppeal)
 
-			// Settings Routes
 			manager.GET("/settings", h.GetSettings)
 			manager.PATCH("/settings", h.UpdateSettings)
 
-			// User Subscription Management Routes
 			manager.POST("/users/:id/subscription", h.AssignSubscription)
-
-			// 2. Add this to the 'manager' group
 			manager.GET("/dashboard-stats", h.GetManagerStats)
-
 		}
 
-		// --- Super Admin-Only Routes (Login + 'administrator' Role Required) ---
+		// --- Super Admin-Only Routes ---
 		admin := v1.Group("/admin")
-		admin.Use(middleware.AuthMiddleware(h.DB))       // 1. Must be logged in
-		admin.Use(middleware.SuperAdminMiddleware(h.DB)) // 2. Must be an Administrator
+		admin.Use(middleware.AuthMiddleware(h.DB))
+		admin.Use(middleware.SuperAdminMiddleware(h.DB))
 		{
 			admin.POST("/create-manager", h.CreateManager)
 		}
 
-		// ... inside func SetupRouter ...
-
-		// --- Dropshipper-Only Routes (Login + Role Required) ---
-		// This group is for the 'dropshipper' role
+		// --- Dropshipper-Only Routes ---
 		dropshipper := v1.Group("/dropshipper")
-		dropshipper.Use(middleware.AuthMiddleware(h.DB))        // 1. Must be logged in
-		dropshipper.Use(middleware.DropshipperMiddleware(h.DB)) // 2. Must be a Dropshipper
+		dropshipper.Use(middleware.AuthMiddleware(h.DB))
+		dropshipper.Use(middleware.DropshipperMiddleware(h.DB))
 		{
-			// Cart Routes
 			dropshipper.GET("/cart", h.GetCart)
 			dropshipper.POST("/cart/items", h.AddToCart)
 			dropshipper.PUT("/cart/items/:product_id", h.UpdateCartItem)
 			dropshipper.DELETE("/cart/items/:product_id", h.DeleteCartItem)
 
-			// Wallet Route
 			dropshipper.GET("/wallet", h.GetMyWallet)
-
-			// Checkout Route
 			dropshipper.POST("/checkout", h.Checkout)
 
-			// --- NEW: Order Routes ---
-			dropshipper.GET("/orders", h.GetMyOrders)         // List all orders
-			dropshipper.GET("/orders/:id", h.GetOrderDetails) // View single order
+			dropshipper.GET("/orders", h.GetMyOrders)
+			dropshipper.GET("/orders/:id", h.GetOrderDetails)
 
-			// 3. Add this to the 'dropshipper' group
 			dropshipper.GET("/dashboard-stats", h.GetDropshipperStats)
 		}
 	}

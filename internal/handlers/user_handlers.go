@@ -288,6 +288,9 @@ func (h *Handlers) Login(c *gin.Context) {
 		return
 	}
 
+	// DEBUG LOG
+	log.Printf("Login Attempt for Email: %s", input.Email)
+
 	// 3. --- Find User By Email ---
 	var user models.User
 	query := "SELECT id, password_hash, role, status FROM users WHERE email = ?"
@@ -301,12 +304,16 @@ func (h *Handlers) Login(c *gin.Context) {
 
 	if err != nil {
 		if err == sql.ErrNoRows {
+			log.Println("DEBUG: User not found in DB.")
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 			return
 		}
+		log.Printf("DEBUG: Database error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
 		return
 	}
+
+	log.Printf("DEBUG: Found User ID: %d, Role: %s, Status: %s", user.ID, user.Role, user.Status)
 
 	// 4. --- CHECK USER STATUS ---
 	switch user.Status {
@@ -320,11 +327,10 @@ func (h *Handlers) Login(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Your account has been suspended. Please contact support."})
 		return
 	case "active":
-		// --- MAINTENANCE MODE CHECK (Merged correctly) ---
+		// --- MAINTENANCE MODE CHECK ---
 		var maintenanceMode string
 		_ = h.DB.QueryRow("SELECT setting_value FROM settings WHERE setting_key = 'maintenance_mode'").Scan(&maintenanceMode)
 
-		// If maintenance is ON and user is NOT an administrator, block login.
 		if maintenanceMode == "true" && user.Role != "administrator" {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "⛔ System is in Maintenance Mode. Logins are temporarily disabled."})
 			return
@@ -332,6 +338,7 @@ func (h *Handlers) Login(c *gin.Context) {
 		// User is active and allowed, continue to password check...
 
 	default:
+		log.Printf("DEBUG: Unknown status '%s'", user.Status)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Unknown user status"})
 		return
 	}
@@ -340,15 +347,22 @@ func (h *Handlers) Login(c *gin.Context) {
 	var password models.Password
 	password.Hash = user.PasswordHash
 
+	// DEBUG: Check password comparison
 	match, err := password.Matches(input.Password)
 	if err != nil {
+		log.Printf("DEBUG: Password match error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check password"})
 		return
 	}
 	if !match {
+		log.Println("DEBUG: Password Mismatch.")
+		log.Printf("DEBUG: Hash from DB: %s", user.PasswordHash)
+		log.Printf("DEBUG: Input Password: %s", input.Password)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
+
+	log.Println("DEBUG: Password MATCHED! Generating token...")
 
 	// 6. --- Generate JWT ---
 	token, err := auth.GenerateToken(user.ID)
