@@ -10,41 +10,39 @@ import (
 
 	"github.com/google/generative-ai-go/genai"
 	"google.golang.org/api/option"
-	// REMOVED: "google.golang.org/api/iterator" to fix the unused import error
+	// REMOVED: iterator import
 )
 
 // AIService holds the Gemini client and the read-only database connection.
 type AIService struct {
 	Client *genai.Client
-	DB     *sql.DB // This must be the Read-Only connection
+	DB     *sql.DB
 }
 
-// NewAIService initializes the Gemini client and stores the read-only DB connection.
+// NewAIService initializes the Gemini client.
 func NewAIService(apiKey string, dbReadOnly *sql.DB) (*AIService, error) {
 	ctx := context.Background()
-
 	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Gemini client: %w", err)
 	}
-
-	return &AIService{
-		Client: client,
-		DB:     dbReadOnly,
-	}, nil
+	return &AIService{Client: client, DB: dbReadOnly}, nil
 }
 
-// GenerateResponse handles the chat interaction.
-func (s *AIService) GenerateResponse(ctx context.Context, userMessage string, userRole string) (string, error) {
-	// 1. Select the Model
-	model := s.Client.GenerativeModel("gemini-1.5-flash")
+// UPDATED: Now returns (response string, totalTokens int, err error)
+func (s *AIService) GenerateResponse(ctx context.Context, userMessage string, userRole string, modelName string) (string, int, error) {
+	// 1. Use the model name passed from the handler (dynamic configuration)
+	if modelName == "" {
+		modelName = "gemini-1.5-flash" // Fallback default
+	}
+	model := s.Client.GenerativeModel(modelName)
 
-	// 2. Define the SQL Tool
+	// 2. Define Tools (Same as before)
 	sqlTool := &genai.Tool{
 		FunctionDeclarations: []*genai.FunctionDeclaration{
 			{
 				Name:        "run_readonly_sql",
-				Description: "Executes a READ-ONLY SQL query (SELECT only) to answer questions about products, users, or inventory.",
+				Description: "Executes a READ-ONLY SQL query (SELECT only) to answer questions.",
 				Parameters: &genai.Schema{
 					Type: genai.TypeObject,
 					Properties: map[string]*genai.Schema{
@@ -60,95 +58,94 @@ func (s *AIService) GenerateResponse(ctx context.Context, userMessage string, us
 	}
 	model.Tools = []*genai.Tool{sqlTool}
 
-	// 3. Configure System Instructions (The "Brain")
-	// We inject the Schema Definition so the AI knows specific table/column names.
+	// 3. System Instructions (Same schema as before)
 	schemaContext := s.getSchemaDefinition()
-
 	model.SystemInstruction = &genai.Content{
 		Parts: []genai.Part{genai.Text(fmt.Sprintf(`
-			You are the TapToSell AI Assistant. 
-			Your role is: %s.
-			
-			You have access to a MySQL database via the 'run_readonly_sql' tool.
-			
-			DATABASE SCHEMA (Strictly follow these table and column names):
-			%s
-
-			RULES:
-			1. ONLY use SELECT statements. NEVER use INSERT, UPDATE, or DELETE.
-			2. If the user asks for data, write a SQL query to fetch it using the schema above.
-			3. Be concise.
-			4. If the user makes a typo (e.g. "frute"), map it to the correct table ("products") based on the schema.
+			You are the TapToSell AI Assistant. Role: %s.
+			Access: MySQL database (run_readonly_sql).
+			Schema: %s
+			Rules: SELECT only. Be concise. Map typos (e.g. "frute") to correct tables.
 		`, userRole, schemaContext))},
 	}
 
-	// 4. Start Chat & Send Message
+	// 4. Execute Chat
 	cs := model.StartChat()
 	res, err := cs.SendMessage(ctx, genai.Text(userMessage))
 	if err != nil {
-		return "", fmt.Errorf("error sending message to Gemini: %w", err)
+		return "", 0, fmt.Errorf("error sending message: %w", err)
 	}
 
-	// 5. Handle Tool Calls Loop
+	// 5. Handle Response & Count Tokens
+	// We need to track tokens across the whole conversation (initial prompt + tool use)
+	// Note: Gemini Go SDK UsageMetadata is on the Response object.
+	totalTokens := 0
+	if res.UsageMetadata != nil {
+		totalTokens += int(res.UsageMetadata.TotalTokenCount)
+	}
+
+	// Loop for Function Calls
 	for {
 		if len(res.Candidates) == 0 || len(res.Candidates[0].Content.Parts) == 0 {
-			return "No response from AI.", nil
+			return "No response.", totalTokens, nil
 		}
 		part := res.Candidates[0].Content.Parts[0]
 
 		funcCall, ok := part.(genai.FunctionCall)
 		if !ok {
-			// It's text, return it.
-			return fmt.Sprintf("%v", part), nil
+			// It's text. Return the text and the total tokens.
+			return fmt.Sprintf("%v", part), totalTokens, nil
 		}
 
+		// Handle SQL Tool
 		if funcCall.Name == "run_readonly_sql" {
 			args := funcCall.Args
 			query, ok := args["query"].(string)
 			if !ok {
-				return "", fmt.Errorf("invalid query argument")
+				return "", totalTokens, fmt.Errorf("invalid query argument")
 			}
-
 			log.Printf("🤖 AI running SQL: %s", query)
 
 			sqlResult, sqlErr := s.runReadOnlyQuery(query)
 			if sqlErr != nil {
-				// Send error back to AI so it can try again
 				sqlResult = fmt.Sprintf("SQL Error: %v", sqlErr)
 			}
 
+			// Send Tool Response back to Gemini
 			res, err = cs.SendMessage(ctx, genai.FunctionResponse{
-				Name: "run_readonly_sql",
-				Response: map[string]interface{}{
-					"result": sqlResult,
-				},
+				Name:     "run_readonly_sql",
+				Response: map[string]interface{}{"result": sqlResult},
 			})
 			if err != nil {
-				return "", fmt.Errorf("error sending tool response: %w", err)
+				return "", totalTokens, fmt.Errorf("tool response error: %w", err)
+			}
+
+			// Add tokens from this new turn
+			if res.UsageMetadata != nil {
+				// Note: UsageMetadata in the response is usually cumulative for the request
+				// For simplicity in this version, we just take the latest TotalTokenCount if available
+				totalTokens = int(res.UsageMetadata.TotalTokenCount)
 			}
 		} else {
-			return "", fmt.Errorf("unknown function call: %s", funcCall.Name)
+			return "", totalTokens, fmt.Errorf("unknown function: %s", funcCall.Name)
 		}
 	}
 }
 
-// runReadOnlyQuery executes the query on the restricted database connection.
+// runReadOnlyQuery (Same as before)
 func (s *AIService) runReadOnlyQuery(query string) (string, error) {
 	normalized := strings.ToUpper(query)
 	if strings.Contains(normalized, "UPDATE") || strings.Contains(normalized, "DELETE") || strings.Contains(normalized, "DROP") || strings.Contains(normalized, "INSERT") {
 		return "", fmt.Errorf("security violation: modify operations are not allowed")
 	}
-
 	rows, err := s.DB.Query(query)
 	if err != nil {
 		return "", err
 	}
 	defer rows.Close()
-
 	columns, _ := rows.Columns()
 	count := len(columns)
 	tableData := []map[string]interface{}{}
-
 	for rows.Next() {
 		values := make([]interface{}, count)
 		valuePtrs := make([]interface{}, count)
@@ -156,7 +153,6 @@ func (s *AIService) runReadOnlyQuery(query string) (string, error) {
 			valuePtrs[i] = &values[i]
 		}
 		rows.Scan(valuePtrs...)
-
 		entry := make(map[string]interface{})
 		for i, col := range columns {
 			var v interface{}
@@ -171,7 +167,6 @@ func (s *AIService) runReadOnlyQuery(query string) (string, error) {
 		}
 		tableData = append(tableData, entry)
 	}
-
 	jsonData, err := json.Marshal(tableData)
 	if err != nil {
 		return "", err
@@ -179,7 +174,7 @@ func (s *AIService) runReadOnlyQuery(query string) (string, error) {
 	return string(jsonData), nil
 }
 
-// getSchemaDefinition provides the "Brain" with the map of the database.
+// getSchemaDefinition (Same as before)
 func (s *AIService) getSchemaDefinition() string {
 	return `
 	- users (id, role [dropshipper, supplier, admin], status [unverified, pending, active, suspended], email, full_name, phone_number, company_name, ssm_number, city, state)
