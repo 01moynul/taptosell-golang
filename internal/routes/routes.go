@@ -9,23 +9,13 @@ import (
 )
 
 // --- NEW: Secure CORS Middleware ---
-// This function tells the browser that it is safe for localhost:5173 to send data to us.
 func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 1. Strictly allow ONLY your local React frontend
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "http://localhost:5173")
-
-		// 2. Allow standard security credentials
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
-
-		// 3. Allow the headers we actually use (specifically "Authorization" for JWT tokens)
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
-
-		// 4. Allow the HTTP methods we use in our API
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE, PATCH")
 
-		// 5. Handle the "Preflight" OPTIONS request
-		// The browser sends this empty request first to check permissions. We must reply with "204 No Content".
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(204)
 			return
@@ -39,8 +29,11 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 	router := gin.Default()
 
 	// --- APPLY THE CORS GUARD ---
-	// This must be the very first thing the router uses
 	router.Use(CORSMiddleware())
+
+	// 1. SERVE UPLOADS STATICALLY (Accessible via http://localhost:8080/uploads/filename.jpg)
+	// This line allows the browser to actually load the images you save.
+	router.Static("/uploads", "./uploads")
 
 	v1 := router.Group("/v1")
 	{
@@ -76,6 +69,10 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 		auth := v1.Group("/")
 		auth.Use(middleware.AuthMiddleware(h.DB))
 		{
+			// 2. FILE UPLOAD ROUTE (Protected)
+			// Used by React to upload images/videos before submitting the product form.
+			auth.POST("/upload", h.UploadFile)
+
 			// Test Route
 			auth.GET("/profile/me", func(c *gin.Context) {
 				userID, _ := c.Get("userID")

@@ -14,111 +14,138 @@ import (
 	"github.com/gosimple/slug"
 )
 
-// --- Product Creation ---
+// --- Inputs ---
 
-// VariantInput defines the structure for a single product variant submitted via the React form.
 type VariantInput struct {
-	SKU   string  `json:"sku"`
-	Price float64 `json:"price" binding:"required,gt=0"`
-	Stock int     `json:"stock" binding:"gte=0"`
-	// Options represents the combination (e.g., [{"name": "Size", "value": "Small"}])
-	Options []models.ProductVariantOption `json:"options" binding:"required,min=1"`
-	// CommissionRate is for per-variant overrides
-	CommissionRate *float64 `json:"commissionRate,omitempty" binding:"omitempty,gte=0"`
+	SKU            string                        `json:"sku"`
+	Price          float64                       `json:"price" binding:"gte=0"`
+	Stock          int                           `json:"stock" binding:"gte=0"`
+	SRP            float64                       `json:"srp"`
+	Options        []models.ProductVariantOption `json:"options" binding:"omitempty,min=1"`
+	CommissionRate *float64                      `json:"commissionRate,omitempty" binding:"omitempty,gte=0"`
 }
 
-// SimpleProductInput defines the fields for a simple (non-variable) product.
 type SimpleProductInput struct {
-	SKU   string  `json:"sku"`
-	Price float64 `json:"price" binding:"required,gt=0"`
-	Stock int     `json:"stock" binding:"gte=0"`
-	// NEW: Added CommissionRate (nullable)
+	SKU            string   `json:"sku"`
+	Price          float64  `json:"price" binding:"gte=0"`
+	Stock          int      `json:"stock" binding:"gte=0"`
+	SRP            float64  `json:"srp"`
 	CommissionRate *float64 `json:"commissionRate,omitempty" binding:"omitempty,gte=0"`
 }
 
-// PackageDimensionsInput matches the nested object in the React form
 type PackageDimensionsInput struct {
 	Length float64 `json:"length" binding:"gte=0"`
 	Width  float64 `json:"width" binding:"gte=0"`
 	Height float64 `json:"height" binding:"gte=0"`
 }
 
-// CreateProductInput is the main struct for the POST /v1/products endpoint.
+// CreateProductInput - Updated for Phase 8.2
 type CreateProductInput struct {
-	Name        string `json:"name" binding:"required"`
-	Description string `json:"description" binding:"required"`
-	Status      string `json:"status" binding:"required,oneof=draft private_inventory pending"`
+	Name        string  `json:"name" binding:"required"`
+	Description string  `json:"description"`
+	Status      string  `json:"status" binding:"required,oneof=draft private_inventory pending"`
+	BrandName   string  `json:"brandName"`
+	BrandID     *int64  `json:"brandId"`
+	CategoryIDs []int64 `json:"category_ids"`
+	IsVariable  bool    `json:"isVariable"`
 
-	// --- Relational Data ---
-	BrandName string `json:"brandName"`
-	BrandID   *int64 `json:"brandId"`
+	// --- New Media Fields ---
+	Images          []string               `json:"images"` // Array of URLs
+	VideoURL        string                 `json:"videoUrl"`
+	SizeChart       map[string]interface{} `json:"sizeChart"`       // Flexible object
+	VariationImages map[string]string      `json:"variationImages"` // {"Red": "url"}
 
-	// --- Relational Data ---
-	CategoryIDs []int64 `json:"categoryIds" binding:"required,min=1"`
-
-	// --- Simple vs. Variable Logic ---
-	IsVariable bool `json:"isVariable"`
-
-	// Only one of these will be populated based on 'isVariable'
 	SimpleProduct *SimpleProductInput `json:"simpleProduct,omitempty"`
 	Variants      []VariantInput      `json:"variants,omitempty"`
 
-	// --- NEW SHIPPING FIELDS ---
 	Weight            *float64                `json:"weight" binding:"omitempty,gt=0"`
 	PackageDimensions *PackageDimensionsInput `json:"packageDimensions,omitempty"`
-
-	// NEW: Added CommissionRate for variable products (applies to all variants for now)
-	CommissionRate *float64 `json:"commissionRate,omitempty" binding:"omitempty,gte=0"`
+	CommissionRate    *float64                `json:"commissionRate,omitempty" binding:"omitempty,gte=0"`
 }
 
-// CreateProduct is the handler for POST /v1/products
+// CreateProduct Handler
 func (h *Handlers) CreateProduct(c *gin.Context) {
-	// 1. --- Get Supplier ID ---
 	userID_raw, exists := c.Get("userID")
 	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "User ID not found in context"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User ID not found"})
 		return
 	}
 	supplierID := userID_raw.(int64)
 
-	// 2. --- Bind & Validate JSON ---
 	var input CreateProductInput
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// 3. --- Validate Logic (Simple vs Variable) ---
-	if input.IsVariable {
-		if len(input.Variants) == 0 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Variable product must have at least one variant"})
+	// --- 1. Validation Logic ---
+	isDraft := input.Status == "draft" || input.Status == "private_inventory"
+	if !isDraft {
+		// STRICT VALIDATION for Pending/Active
+		if input.Description == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Description is required for submission."})
 			return
 		}
-		input.SimpleProduct = nil
-	} else {
-		if input.SimpleProduct == nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Simple product must have simpleProduct data"})
+		if len(input.CategoryIDs) == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Category is required."})
 			return
 		}
-		input.Variants = nil
+		if input.BrandID == nil && input.BrandName == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Brand is required."})
+			return
+		}
+		// NEW: Image Validation
+		if len(input.Images) == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "At least 1 product image is required."})
+			return
+		}
+
+		if input.IsVariable {
+			if len(input.Variants) == 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Variants are required."})
+				return
+			}
+		} else {
+			if input.SimpleProduct == nil || input.SimpleProduct.Price <= 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Price is required."})
+				return
+			}
+		}
 	}
 
-	// 4. --- Begin Database Transaction ---
 	tx, err := h.DB.Begin()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start database transaction"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "DB Transaction failed"})
 		return
 	}
 	defer tx.Rollback()
 
-	// 5. --- Handle Brand (Get or Create) ---
-	brandID, err := h.getOrCreateBrandID(tx, input.BrandID, input.BrandName)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
+	// --- 2. Handle Brand ---
+	var brandID int64
+	var brandNameLegacy string = "Generic"
+	if input.BrandID != nil || input.BrandName != "" {
+		brandID, err = h.getOrCreateBrandID(tx, input.BrandID, input.BrandName)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if input.BrandName != "" {
+			brandNameLegacy = input.BrandName
+		}
 	}
 
-	// 6. --- Create the Core Product ---
+	// --- 3. Prepare JSON Data ---
+	// We marshal the arrays/maps to strings for the DB
+	imagesJSON, _ := json.Marshal(input.Images)
+	sizeChartJSON, _ := json.Marshal(input.SizeChart)
+	variationImagesJSON, _ := json.Marshal(input.VariationImages)
+
+	var videoURL sql.NullString
+	if input.VideoURL != "" {
+		videoURL = sql.NullString{String: input.VideoURL, Valid: true}
+	}
+
+	// --- 4. Prepare Product Data ---
 	product := &models.Product{
 		SupplierID:  supplierID,
 		Name:        input.Name,
@@ -129,196 +156,134 @@ func (h *Handlers) CreateProduct(c *gin.Context) {
 		UpdatedAt:   time.Now(),
 	}
 
-	// Handle Commission (nullable)
+	// Logic for Price, Stock, Legacy Columns
+	var srp float64 = 0
+	var weightGrams int = 0
+	var categoryLegacy string = "Uncategorized"
+
 	var commissionRate sql.NullFloat64
-	if !input.IsVariable {
-		// Simple Product: Use commission from simpleProduct object
+	product.PriceToTTS = 0
+	product.StockQuantity = 0
+
+	if !input.IsVariable && input.SimpleProduct != nil {
 		product.PriceToTTS = input.SimpleProduct.Price
 		product.StockQuantity = input.SimpleProduct.Stock
 		product.SKU = sql.NullString{String: input.SimpleProduct.SKU, Valid: input.SimpleProduct.SKU != ""}
+		srp = input.SimpleProduct.SRP
 		if input.SimpleProduct.CommissionRate != nil {
 			commissionRate = sql.NullFloat64{Float64: *input.SimpleProduct.CommissionRate, Valid: true}
 		}
 	} else {
-		// Variable Product: Use top-level commissionRate
 		if input.CommissionRate != nil {
 			commissionRate = sql.NullFloat64{Float64: *input.CommissionRate, Valid: true}
 		}
-		// Price/Stock are 0 on the main product, they live in variants
-		product.PriceToTTS = 0
-		product.StockQuantity = 0
 	}
-	product.CommissionRate = commissionRate // Assign to model
+	product.CommissionRate = commissionRate
 
-	// Handle nullable shipping fields
-	var weight sql.NullFloat64
-	var pkgLength sql.NullFloat64
-	var pkgWidth sql.NullFloat64
-	var pkgHeight sql.NullFloat64
-
+	var weight, pkgLength, pkgWidth, pkgHeight sql.NullFloat64
 	if input.Weight != nil {
 		weight = sql.NullFloat64{Float64: *input.Weight, Valid: true}
+		weightGrams = int(*input.Weight * 1000)
 	}
-
 	if input.PackageDimensions != nil {
 		pkgLength = sql.NullFloat64{Float64: input.PackageDimensions.Length, Valid: true}
 		pkgWidth = sql.NullFloat64{Float64: input.PackageDimensions.Width, Valid: true}
 		pkgHeight = sql.NullFloat64{Float64: input.PackageDimensions.Height, Valid: true}
 	}
 
-	// UPDATED: Query uses price_to_tts, stock_quantity, and commission_rate
+	// --- 5. INSERT QUERY (Updated) ---
 	productQuery := `
 		INSERT INTO products
 		(supplier_id, name, description, price_to_tts, stock_quantity, sku, 
 		is_variable, status, created_at, updated_at, 
-		weight, pkg_length, pkg_width, pkg_height, commission_rate)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		weight, pkg_length, pkg_width, pkg_height, commission_rate,
+		category, brand, srp, weight_grams,
+		images, video_url, size_chart, variation_images) 
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	result, err := tx.Exec(productQuery,
 		product.SupplierID, product.Name, product.Description,
 		product.PriceToTTS, product.StockQuantity, product.SKU,
 		product.IsVariable, product.Status, product.CreatedAt, product.UpdatedAt,
 		weight, pkgLength, pkgWidth, pkgHeight, product.CommissionRate,
+		categoryLegacy, brandNameLegacy, srp, weightGrams,
+		string(imagesJSON), videoURL, string(sizeChartJSON), string(variationImagesJSON), // NEW
 	)
 	if err != nil {
+		fmt.Printf("DB Error: %v\n", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to insert product"})
 		return
 	}
 	productID, err := result.LastInsertId()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get new product ID"})
-		return
-	}
-	product.ID = productID
-
-	// 7. --- Link Categories ---
-	categoryQuery := `INSERT INTO product_categories (product_id, category_id) VALUES (?, ?)`
-	for _, catID := range input.CategoryIDs {
-		_, err := tx.Exec(categoryQuery, productID, catID)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to link category"})
-			return
-		}
-	}
-
-	// 8. --- Link Brand ---
-	brandQuery := `INSERT INTO product_brands (product_id, brand_id) VALUES (?, ?)`
-	_, err = tx.Exec(brandQuery, productID, brandID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to link brand"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get ID"})
 		return
 	}
 
-	// 9. --- Handle Variants ---
-	if product.IsVariable {
-		variantQuery := `
-			INSERT INTO product_variants
-			(product_id, sku, price_to_tts, stock_quantity, options, commission_rate, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+	// --- 6. Link Relations ---
+	if len(input.CategoryIDs) > 0 {
+		catQ := `INSERT INTO product_categories (product_id, category_id) VALUES (?, ?)`
+		for _, cid := range input.CategoryIDs {
+			tx.Exec(catQ, productID, cid)
+		}
+	}
+	if brandID != 0 {
+		tx.Exec(`INSERT INTO product_brands (product_id, brand_id) VALUES (?, ?)`, productID, brandID)
+	}
 
-		for _, variant := range input.Variants {
-			// Marshal the Options struct into a JSON string for the DB column
-			optionsJSON, err := json.Marshal(variant.Options)
-			if err != nil {
-				// We commit the product, but fail on variant creation
-				tx.Rollback()
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal variant options"})
-				return
+	// --- 7. Handle Variants ---
+	if product.IsVariable && len(input.Variants) > 0 {
+		varQ := `INSERT INTO product_variants (product_id, sku, price_to_tts, stock_quantity, options, commission_rate, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+		for _, v := range input.Variants {
+			optJSON, _ := json.Marshal(v.Options)
+			var vComm sql.NullFloat64
+			if v.CommissionRate != nil {
+				vComm = sql.NullFloat64{Float64: *v.CommissionRate, Valid: true}
 			}
-
-			// Handle variant-specific CommissionRate (nullable)
-			var variantCommissionRate sql.NullFloat64
-			if variant.CommissionRate != nil {
-				variantCommissionRate = sql.NullFloat64{Float64: *variant.CommissionRate, Valid: true}
-			}
-
-			// Handle SKU (nullable)
-			sku := sql.NullString{String: variant.SKU, Valid: variant.SKU != ""}
-
-			_, err = tx.Exec(variantQuery,
-				productID,
-				sku,
-				variant.Price,
-				variant.Stock,
-				string(optionsJSON),
-				variantCommissionRate,
-				time.Now(),
-				time.Now(),
-			)
-			if err != nil {
-				tx.Rollback()
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to insert product variant"})
-				return
-			}
+			sku := sql.NullString{String: v.SKU, Valid: v.SKU != ""}
+			tx.Exec(varQ, productID, sku, v.Price, v.Stock, string(optJSON), vComm, time.Now(), time.Now())
 		}
 	}
 
-	// 10. --- TODO: Notify Managers (Phase 4.4) ---
-	// If product.Status == "pending", we would add logic here
-	// to send a notification to all users with the 'manager' role.
-
-	// 11. --- Commit Transaction ---
 	if err := tx.Commit(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Commit failed"})
 		return
 	}
 
-	// 12. --- Send Success Response ---
-	c.JSON(http.StatusCreated, gin.H{
-		"message":   "Product created successfully",
-		"productId": product.ID,
-	})
+	c.JSON(http.StatusCreated, gin.H{"message": "Product saved", "productId": productID})
 }
 
-// getOrCreateBrandID (No changes needed in this helper)
+// getOrCreateBrandID (Helper)
 func (h *Handlers) getOrCreateBrandID(tx *sql.Tx, brandID *int64, brandName string) (int64, error) {
-	// Case 1: An existing BrandID was provided.
 	if brandID != nil {
 		var exists int
 		err := tx.QueryRow("SELECT 1 FROM brands WHERE id = ?", *brandID).Scan(&exists)
 		if err != nil {
-			if err == sql.ErrNoRows {
-				return 0, errors.New("invalid brandId: brand does not exist")
-			}
-			return 0, err
+			// FIXED: lowercase "invalid"
+			return 0, errors.New("invalid brandId")
 		}
 		return *brandID, nil
 	}
-
-	// Case 2: A new BrandName was provided.
 	if brandName != "" {
 		var existingID int64
 		slug := slug.Make(brandName)
 		err := tx.QueryRow("SELECT id FROM brands WHERE slug = ?", slug).Scan(&existingID)
-		if err != nil && err != sql.ErrNoRows {
-			return 0, err
-		}
 		if err == nil {
 			return existingID, nil
 		}
 
-		now := time.Now()
-		query := `INSERT INTO brands (name, slug, created_at, updated_at) VALUES (?, ?, ?, ?)`
-		result, err := tx.Exec(query, brandName, slug, now, now)
+		res, err := tx.Exec(`INSERT INTO brands (name, slug) VALUES (?, ?)`, brandName, slug)
 		if err != nil {
 			return 0, err
 		}
-		newID, err := result.LastInsertId()
-		if err != nil {
-			return 0, err
-		}
-		return newID, nil
+		return res.LastInsertId()
 	}
-
-	// Case 3: Neither was provided.
-	return 0, errors.New("a brandId or a new brandName is required")
+	// FIXED: Lowercase "brand"
+	return 0, errors.New("brand required")
 }
 
-// --- Product Retrieval ---
-
-// GetMyProducts is the handler for GET /v1/products/supplier/me
+// --- Product Retrieval (Same as before) ---
 func (h *Handlers) GetMyProducts(c *gin.Context) {
-	// 1. --- Get Supplier ID ---
 	userID_raw, exists := c.Get("userID")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User ID not found in context"})
@@ -326,10 +291,8 @@ func (h *Handlers) GetMyProducts(c *gin.Context) {
 	}
 	supplierID := userID_raw.(int64)
 
-	// 2. --- Build Query with Filtering ---
 	statusFilter := c.Query("status")
 
-	// UPDATED: Query uses price_to_tts, stock_quantity, and commission_rate
 	query := `
 		SELECT 
 			id, supplier_id, sku, name, description, price_to_tts, stock_quantity, 
@@ -347,7 +310,6 @@ func (h *Handlers) GetMyProducts(c *gin.Context) {
 
 	query += " ORDER BY created_at DESC"
 
-	// 3. --- Execute Query ---
 	rows, err := h.DB.Query(query, args...)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database query failed"})
@@ -355,12 +317,10 @@ func (h *Handlers) GetMyProducts(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	// 4. --- Scan Rows into Slice ---
 	var products []*models.Product
 
 	for rows.Next() {
 		var product models.Product
-		// UPDATED: Scan uses &product.PriceToTTS, &product.StockQuantity, &product.CommissionRate
 		if err := rows.Scan(
 			&product.ID,
 			&product.SupplierID,
@@ -385,12 +345,6 @@ func (h *Handlers) GetMyProducts(c *gin.Context) {
 		products = append(products, &product)
 	}
 
-	if err = rows.Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error iterating product rows"})
-		return
-	}
-
-	// 5. --- Send Success Response ---
 	c.JSON(http.StatusOK, gin.H{
 		"products": products,
 	})
@@ -398,48 +352,35 @@ func (h *Handlers) GetMyProducts(c *gin.Context) {
 
 // --- Product Update ---
 
-// UpdateProductInput uses pointers (*) so we can tell nil vs. zero-value.
 type UpdateProductInput struct {
 	Name        *string `json:"name"`
 	Description *string `json:"description"`
 	Status      *string `json:"status,omitempty" binding:"omitempty,oneof=draft private_inventory pending"`
 
-	// --- Relational Data ---
 	BrandName *string `json:"brandName"`
 	BrandID   *int64  `json:"brandId"`
 
-	// We expect the *full* new list of category IDs
-	CategoryIDs *[]int64 `json:"categoryIds"`
+	CategoryIDs *[]int64 `json:"category_ids"`
 
-	// --- Simple Product Update ---
-	// Note: We re-use SimpleProductInput which now includes CommissionRate
-	SimpleProduct *SimpleProductInput `json:"simpleProduct,omitempty"`
+	SimpleProduct  *SimpleProductInput `json:"simpleProduct,omitempty"`
+	Variants       []VariantInput      `json:"variants,omitempty"`
+	CommissionRate *float64            `json:"commissionRate,omitempty" binding:"omitempty,gte=0"`
 
-	// --- Variable Product Update ---
-	// We will handle this later. For now, they can update top-level commission.
-	Variants       []VariantInput `json:"variants,omitempty"`
-	CommissionRate *float64       `json:"commissionRate,omitempty" binding:"omitempty,gte=0"`
-
-	// --- Shipping Fields ---
 	Weight            *float64                `json:"weight" binding:"omitempty,gt=0"`
 	PackageDimensions *PackageDimensionsInput `json:"packageDimensions,omitempty"`
 }
 
 // UpdateProduct is the handler for PUT /v1/products/:id
 func (h *Handlers) UpdateProduct(c *gin.Context) {
-	// 1. --- Get IDs ---
 	userID_raw, _ := c.Get("userID")
 	supplierID := userID_raw.(int64)
-
 	productIDStr := c.Param("id")
 
-	// 2. --- Verify Ownership ---
-	// UPDATED: Query uses price_to_tts
 	var currentProduct models.Product
 	err := h.DB.QueryRow("SELECT id, status, price_to_tts, is_variable FROM products WHERE id = ? AND supplier_id = ?", productIDStr, supplierID).Scan(
 		&currentProduct.ID,
 		&currentProduct.Status,
-		&currentProduct.PriceToTTS, // UPDATED
+		&currentProduct.PriceToTTS,
 		&currentProduct.IsVariable,
 	)
 	if err != nil {
@@ -451,14 +392,12 @@ func (h *Handlers) UpdateProduct(c *gin.Context) {
 		return
 	}
 
-	// 3. --- Bind & Validate JSON ---
 	var input UpdateProductInput
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// 4. --- Begin Database Transaction ---
 	tx, err := h.DB.Begin()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction"})
@@ -466,9 +405,8 @@ func (h *Handlers) UpdateProduct(c *gin.Context) {
 	}
 	defer tx.Rollback()
 
-	// 4.5 --- Price Change Validation (Roadmap 5.3) ---
+	// 4.5 --- Price Change Validation ---
 	if currentProduct.Status == "published" && !currentProduct.IsVariable && input.SimpleProduct != nil {
-		// UPDATED: Check against PriceToTTS
 		if input.SimpleProduct.Price != currentProduct.PriceToTTS {
 			c.JSON(http.StatusForbidden, gin.H{
 				"error": "You cannot change the price of a 'published' product. Please use the 'Request Price Change' feature.",
@@ -476,7 +414,6 @@ func (h *Handlers) UpdateProduct(c *gin.Context) {
 			return
 		}
 	}
-	// TODO: Add logic for variable product price change blocking later
 
 	// 5. --- Dynamically Build UPDATE Query ---
 	querySet := "updated_at = ?"
@@ -503,29 +440,19 @@ func (h *Handlers) UpdateProduct(c *gin.Context) {
 		queryArgs = append(queryArgs, input.PackageDimensions.Length, input.PackageDimensions.Width, input.PackageDimensions.Height)
 	}
 
-	// Handle Simple vs Variable updates
 	if !currentProduct.IsVariable && input.SimpleProduct != nil {
-		// Simple Product Update
-		// UPDATED: Uses price_to_tts and stock_quantity
 		querySet += ", price_to_tts = ?, stock_quantity = ?, sku = ?"
 		queryArgs = append(queryArgs, input.SimpleProduct.Price, input.SimpleProduct.Stock, input.SimpleProduct.SKU)
-
-		// NEW: Update commission rate if provided
 		if input.SimpleProduct.CommissionRate != nil {
 			querySet += ", commission_rate = ?"
 			queryArgs = append(queryArgs, *input.SimpleProduct.CommissionRate)
 		}
 	} else if currentProduct.IsVariable && input.CommissionRate != nil {
-		// Variable Product Update
-		// NEW: Update top-level commission rate if provided
 		querySet += ", commission_rate = ?"
 		queryArgs = append(queryArgs, *input.CommissionRate)
 	}
-	// TODO: Handle input.Variants update here later
 
-	// Add the product ID for the WHERE clause
 	queryArgs = append(queryArgs, productIDStr)
-
 	query := fmt.Sprintf("UPDATE products SET %s WHERE id = ?", querySet)
 
 	_, err = tx.Exec(query, queryArgs...)
@@ -534,7 +461,6 @@ func (h *Handlers) UpdateProduct(c *gin.Context) {
 		return
 	}
 
-	// 6. --- Handle Category Update ---
 	if input.CategoryIDs != nil {
 		_, err := tx.Exec("DELETE FROM product_categories WHERE product_id = ?", productIDStr)
 		if err != nil {
@@ -552,19 +478,16 @@ func (h *Handlers) UpdateProduct(c *gin.Context) {
 		}
 	}
 
-	// 7. --- Handle Brand Update ---
 	if input.BrandID != nil || (input.BrandName != nil && *input.BrandName != "") {
 		brandNameStr := ""
 		if input.BrandName != nil {
 			brandNameStr = *input.BrandName
 		}
-
 		newBrandID, err := h.getOrCreateBrandID(tx, input.BrandID, brandNameStr)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-
 		_, err = tx.Exec("UPDATE product_brands SET brand_id = ? WHERE product_id = ?", newBrandID, productIDStr)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update brand link"})
@@ -572,29 +495,23 @@ func (h *Handlers) UpdateProduct(c *gin.Context) {
 		}
 	}
 
-	// 8. --- Commit Transaction ---
 	if err := tx.Commit(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
 		return
 	}
 
-	// 9. --- Send Success Response ---
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Product updated successfully",
 	})
 }
 
-// --- Product Deletion ---
-
-// DeleteProduct (No changes needed in this handler)
+// DeleteProduct and SearchProducts (Include SearchProducts and RequestPriceChange logic from previous file)
 func (h *Handlers) DeleteProduct(c *gin.Context) {
-	// 1. --- Get IDs ---
 	userID_raw, _ := c.Get("userID")
 	supplierID := userID_raw.(int64)
 
 	productIDStr := c.Param("id")
 
-	// 2. --- Execute Deletion with Ownership Check ---
 	query := "DELETE FROM products WHERE id = ? AND supplier_id = ?"
 
 	result, err := h.DB.Exec(query, productIDStr, supplierID)
@@ -603,7 +520,6 @@ func (h *Handlers) DeleteProduct(c *gin.Context) {
 		return
 	}
 
-	// 3. --- Check Rows Affected ---
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check affected rows"})
@@ -614,28 +530,21 @@ func (h *Handlers) DeleteProduct(c *gin.Context) {
 		return
 	}
 
-	// 4. --- Send Success Response ---
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Product deleted successfully",
 	})
 }
 
-// --- Public Product Search ---
-
-// SearchProducts is the handler for GET /v1/products/search
 func (h *Handlers) SearchProducts(c *gin.Context) {
-	// 1. --- Define Query Parameters ---
 	q := c.Query("q")
 	categoryID := c.Query("category")
 	brandID := c.Query("brand")
 	minPrice := c.Query("min_price")
 	maxPrice := c.Query("max_price")
 
-	// 2. --- Dynamically Build Query ---
 	var queryBuilder strings.Builder
 	var args []interface{}
 
-	// UPDATED: Query uses price_to_tts, stock_quantity, and commission_rate
 	queryBuilder.WriteString(`
 		SELECT DISTINCT
 			p.id, p.supplier_id, p.sku, p.name, p.description,
@@ -663,7 +572,6 @@ func (h *Handlers) SearchProducts(c *gin.Context) {
 		queryBuilder.WriteString(" AND pb.brand_id = ?")
 		args = append(args, brandID)
 	}
-	// UPDATED: Filter uses p.price_to_tts
 	if minPrice != "" {
 		queryBuilder.WriteString(" AND p.price_to_tts >= ?")
 		args = append(args, minPrice)
@@ -680,7 +588,6 @@ func (h *Handlers) SearchProducts(c *gin.Context) {
 
 	queryBuilder.WriteString(" ORDER BY p.created_at DESC")
 
-	// 3. --- Execute Query ---
 	query := queryBuilder.String()
 	rows, err := h.DB.Query(query, args...)
 	if err != nil {
@@ -689,11 +596,9 @@ func (h *Handlers) SearchProducts(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	// 4. --- Scan Rows into Slice ---
 	var products []*models.Product
 	for rows.Next() {
 		var product models.Product
-		// UPDATED: Scan uses &product.PriceToTTS, &product.StockQuantity, &product.CommissionRate
 		if err := rows.Scan(
 			&product.ID,
 			&product.SupplierID,
@@ -722,37 +627,27 @@ func (h *Handlers) SearchProducts(c *gin.Context) {
 		return
 	}
 
-	// 5. --- Send Success Response ---
 	c.JSON(http.StatusOK, gin.H{
 		"products": products,
 	})
 }
 
-//
-// --- Price Appeal Handlers ---
-//
-
-// RequestPriceChangeInput (No changes needed)
 type RequestPriceChangeInput struct {
 	NewPrice float64 `json:"newPrice" binding:"required,gt=0"`
 	Reason   string  `json:"reason,omitempty"`
 }
 
-// RequestPriceChange is the handler for POST /v1/products/:id/request-price-change
 func (h *Handlers) RequestPriceChange(c *gin.Context) {
-	// 1. --- Get IDs ---
 	userID_raw, _ := c.Get("userID")
 	supplierID := userID_raw.(int64)
 	productIDStr := c.Param("id")
 
-	// 2. --- Bind & Validate JSON ---
 	var input RequestPriceChangeInput
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// 3. --- Begin Transaction ---
 	tx, err := h.DB.Begin()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction"})
@@ -760,15 +655,12 @@ func (h *Handlers) RequestPriceChange(c *gin.Context) {
 	}
 	defer tx.Rollback()
 
-	// 4. --- Get Product & Verify Ownership/Status ---
 	var currentProduct models.Product
-	// UPDATED: Query uses price_to_tts
 	query := `
 		SELECT id, supplier_id, price_to_tts, status 
 		FROM products 
 		WHERE id = ? FOR UPDATE
 	`
-	// UPDATED: Scan uses &product.PriceToTTS
 	err = tx.QueryRow(query, productIDStr).Scan(
 		&currentProduct.ID,
 		&currentProduct.SupplierID,
@@ -794,13 +686,11 @@ func (h *Handlers) RequestPriceChange(c *gin.Context) {
 		return
 	}
 
-	// UPDATED: Check against PriceToTTS
 	if currentProduct.PriceToTTS == input.NewPrice {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "The new price must be different from the current price"})
 		return
 	}
 
-	// 5. --- Check for Existing Pending Appeal ---
 	var pendingCount int
 	checkQuery := "SELECT COUNT(*) FROM price_appeals WHERE product_id = ? AND status = 'pending'"
 	err = tx.QueryRow(checkQuery, productIDStr).Scan(&pendingCount)
@@ -813,13 +703,11 @@ func (h *Handlers) RequestPriceChange(c *gin.Context) {
 		return
 	}
 
-	// 6. --- Create the Price Appeal ---
 	var nullReason sql.NullString
 	if input.Reason != "" {
 		nullReason = sql.NullString{String: input.Reason, Valid: true}
 	}
 
-	// UPDATED: Uses currentProduct.PriceToTTS as old_price
 	appealQuery := `
 		INSERT INTO price_appeals
 		(product_id, supplier_id, old_price, new_price, reason, status, created_at, updated_at)
@@ -829,7 +717,7 @@ func (h *Handlers) RequestPriceChange(c *gin.Context) {
 	_, err = tx.Exec(appealQuery,
 		currentProduct.ID,
 		supplierID,
-		currentProduct.PriceToTTS, // UPDATED
+		currentProduct.PriceToTTS,
 		input.NewPrice,
 		nullReason,
 		now,
@@ -840,13 +728,11 @@ func (h *Handlers) RequestPriceChange(c *gin.Context) {
 		return
 	}
 
-	// 7. --- Commit Transaction ---
 	if err := tx.Commit(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
 		return
 	}
 
-	// 8. --- Send Success Response ---
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "Price appeal submitted successfully and is pending review.",
 	})
