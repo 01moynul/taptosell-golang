@@ -38,8 +38,14 @@ func (h *Handlers) UploadFile(c *gin.Context) {
 	}
 
 	// 5. Return the public URL
-	// Assuming your server runs on localhost:8080
-	publicURL := fmt.Sprintf("http://localhost:8080/uploads/%s", newFilename)
+	// Get the dynamic base URL from .env
+	baseURL := os.Getenv("BASE_URL")
+	if baseURL == "" {
+		baseURL = "http://localhost:8080"
+	}
+
+	// Construct the URL dynamically
+	publicURL := fmt.Sprintf("%s/uploads/%s", baseURL, newFilename)
 
 	c.JSON(http.StatusOK, gin.H{
 		"url": publicURL,
