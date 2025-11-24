@@ -145,7 +145,7 @@ func (h *Handlers) CreateProduct(c *gin.Context) {
 		videoURL = sql.NullString{String: input.VideoURL, Valid: true}
 	}
 
-	// --- 4. Prepare Product Data ---
+	// --- 4. Prepare Product Data (Fixed) ---
 	product := &models.Product{
 		SupplierID:  supplierID,
 		Name:        input.Name,
@@ -162,10 +162,13 @@ func (h *Handlers) CreateProduct(c *gin.Context) {
 	var categoryLegacy string = "Uncategorized"
 
 	var commissionRate sql.NullFloat64
+
+	// Initialize defaults
 	product.PriceToTTS = 0
 	product.StockQuantity = 0
 
 	if !input.IsVariable && input.SimpleProduct != nil {
+		// SIMPLE PRODUCT
 		product.PriceToTTS = input.SimpleProduct.Price
 		product.StockQuantity = input.SimpleProduct.Stock
 		product.SKU = sql.NullString{String: input.SimpleProduct.SKU, Valid: input.SimpleProduct.SKU != ""}
@@ -173,13 +176,28 @@ func (h *Handlers) CreateProduct(c *gin.Context) {
 		if input.SimpleProduct.CommissionRate != nil {
 			commissionRate = sql.NullFloat64{Float64: *input.SimpleProduct.CommissionRate, Valid: true}
 		}
-	} else {
+	} else if input.IsVariable && len(input.Variants) > 0 {
+		// VARIABLE PRODUCT: Roll-up logic (Fixes Dashboard Zeros)
+		var totalStock int
+		var minPrice float64 = input.Variants[0].Price
+
+		for _, v := range input.Variants {
+			totalStock += v.Stock
+			if v.Price < minPrice {
+				minPrice = v.Price
+			}
+		}
+
+		product.PriceToTTS = minPrice
+		product.StockQuantity = totalStock
+
 		if input.CommissionRate != nil {
 			commissionRate = sql.NullFloat64{Float64: *input.CommissionRate, Valid: true}
 		}
 	}
 	product.CommissionRate = commissionRate
 
+	// --- DEFINING THE MISSING VARIABLES HERE ---
 	var weight, pkgLength, pkgWidth, pkgHeight sql.NullFloat64
 	if input.Weight != nil {
 		weight = sql.NullFloat64{Float64: *input.Weight, Valid: true}
@@ -191,7 +209,7 @@ func (h *Handlers) CreateProduct(c *gin.Context) {
 		pkgHeight = sql.NullFloat64{Float64: input.PackageDimensions.Height, Valid: true}
 	}
 
-	// --- 5. INSERT QUERY (Updated) ---
+	// --- 5. INSERT QUERY ---
 	productQuery := `
 		INSERT INTO products
 		(supplier_id, name, description, price_to_tts, stock_quantity, sku, 
@@ -207,7 +225,7 @@ func (h *Handlers) CreateProduct(c *gin.Context) {
 		product.IsVariable, product.Status, product.CreatedAt, product.UpdatedAt,
 		weight, pkgLength, pkgWidth, pkgHeight, product.CommissionRate,
 		categoryLegacy, brandNameLegacy, srp, weightGrams,
-		string(imagesJSON), videoURL, string(sizeChartJSON), string(variationImagesJSON), // NEW
+		string(imagesJSON), videoURL, string(sizeChartJSON), string(variationImagesJSON),
 	)
 	if err != nil {
 		fmt.Printf("DB Error: %v\n", err)
@@ -282,7 +300,7 @@ func (h *Handlers) getOrCreateBrandID(tx *sql.Tx, brandID *int64, brandName stri
 	return 0, errors.New("brand required")
 }
 
-// --- Product Retrieval (Same as before) ---
+// GetMyProducts (Updated to fetch Images)
 func (h *Handlers) GetMyProducts(c *gin.Context) {
 	userID_raw, exists := c.Get("userID")
 	if !exists {
@@ -293,11 +311,13 @@ func (h *Handlers) GetMyProducts(c *gin.Context) {
 
 	statusFilter := c.Query("status")
 
+	// [FIX] Added 'images' to the SELECT query
 	query := `
 		SELECT 
 			id, supplier_id, sku, name, description, price_to_tts, stock_quantity, 
 			is_variable, status, created_at, updated_at,
-			weight, pkg_length, pkg_width, pkg_height, commission_rate
+			weight, pkg_length, pkg_width, pkg_height, commission_rate,
+			images
 		FROM products
 		WHERE supplier_id = ?`
 
@@ -321,6 +341,8 @@ func (h *Handlers) GetMyProducts(c *gin.Context) {
 
 	for rows.Next() {
 		var product models.Product
+		var dbImages []byte // [FIX] Buffer for the JSON string
+
 		if err := rows.Scan(
 			&product.ID,
 			&product.SupplierID,
@@ -338,10 +360,19 @@ func (h *Handlers) GetMyProducts(c *gin.Context) {
 			&product.PkgWidth,
 			&product.PkgHeight,
 			&product.CommissionRate,
+			&dbImages, // [FIX] Scan images
 		); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to scan product row"})
 			return
 		}
+
+		// [FIX] Parse the JSON images
+		if len(dbImages) > 0 {
+			json.Unmarshal(dbImages, &product.Images)
+		} else {
+			product.Images = []string{}
+		}
+
 		products = append(products, &product)
 	}
 
@@ -736,4 +767,186 @@ func (h *Handlers) RequestPriceChange(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "Price appeal submitted successfully and is pending review.",
 	})
+}
+
+// ProductDetailResponse matches the structure needed by the Frontend "Edit" Form
+type ProductDetailResponse struct {
+	ID          int64   `json:"id"`
+	SupplierID  int64   `json:"supplierId"`
+	Name        string  `json:"name"`
+	Description string  `json:"description"`
+	Status      string  `json:"status"`
+	IsVariable  bool    `json:"isVariable"`
+	SKU         *string `json:"sku"` // For Simple Products
+
+	// Prices & Stock
+	PriceToTTS     float64  `json:"priceToTTS"`
+	SRP            float64  `json:"srp"`
+	StockQuantity  int      `json:"stockQuantity"`
+	CommissionRate *float64 `json:"commissionRate"`
+
+	// Dimensions
+	Weight            *float64                `json:"weight"`
+	PackageDimensions *PackageDimensionsInput `json:"packageDimensions"`
+
+	// Media (Parsed from JSON)
+	Images          []string               `json:"images"`
+	VideoURL        string                 `json:"videoUrl"`
+	SizeChart       map[string]interface{} `json:"sizeChart"`
+	VariationImages map[string]string      `json:"variationImages"`
+
+	// Relations
+	BrandID     int64   `json:"brandId"`
+	BrandName   string  `json:"brandName"`
+	CategoryIDs []int64 `json:"category_ids"`
+
+	// Variants
+	Variants []VariantInput `json:"variants"`
+}
+
+// GetProduct (Updated for Edit Page Reliability)
+func (h *Handlers) GetProduct(c *gin.Context) {
+	userID_raw, exists := c.Get("userID")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User ID not found"})
+		return
+	}
+	userID := userID_raw.(int64)
+	userRole := c.GetString("userRole")
+	productID := c.Param("id")
+
+	// 1. Fetch Core Product Data
+	query := `
+		SELECT 
+			id, supplier_id, name, description, status, is_variable, 
+			sku, price_to_tts, srp, stock_quantity, commission_rate,
+			weight, pkg_length, pkg_width, pkg_height,
+			images, video_url, size_chart, variation_images,
+			brand
+		FROM products 
+		WHERE id = ?`
+
+	var p ProductDetailResponse
+	var dbImages, dbSizeChart, dbVariationImages []byte
+	var dbVideoURL, dbSKU, dbBrandName sql.NullString
+	var dbWeight, dbLen, dbWid, dbHgt, dbComm sql.NullFloat64
+
+	err := h.DB.QueryRow(query, productID).Scan(
+		&p.ID, &p.SupplierID, &p.Name, &p.Description, &p.Status, &p.IsVariable,
+		&dbSKU, &p.PriceToTTS, &p.SRP, &p.StockQuantity, &dbComm,
+		&dbWeight, &dbLen, &dbWid, &dbHgt,
+		&dbImages, &dbVideoURL, &dbSizeChart, &dbVariationImages,
+		&dbBrandName,
+	)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Product not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error", "details": err.Error()})
+		return
+	}
+
+	// 2. Security Check
+	isManager := (userRole == "manager" || userRole == "administrator")
+	if !isManager && p.SupplierID != userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You do not have permission to view this product"})
+		return
+	}
+
+	// 3. Process Nullables
+	if dbSKU.Valid {
+		p.SKU = &dbSKU.String
+	}
+	if dbVideoURL.Valid {
+		p.VideoURL = dbVideoURL.String
+	}
+	if dbBrandName.Valid {
+		p.BrandName = dbBrandName.String
+	}
+	if dbComm.Valid {
+		val := dbComm.Float64
+		p.CommissionRate = &val
+	}
+
+	// [FIX] Always initialize arrays to avoid "null" in JSON
+	p.Images = []string{}
+	if len(dbImages) > 0 {
+		json.Unmarshal(dbImages, &p.Images)
+	}
+
+	p.SizeChart = nil
+	if len(dbSizeChart) > 0 {
+		json.Unmarshal(dbSizeChart, &p.SizeChart)
+	}
+
+	p.VariationImages = make(map[string]string)
+	if len(dbVariationImages) > 0 {
+		json.Unmarshal(dbVariationImages, &p.VariationImages)
+	}
+
+	if dbWeight.Valid {
+		val := dbWeight.Float64
+		p.Weight = &val
+	}
+
+	p.PackageDimensions = &PackageDimensionsInput{Length: 0, Width: 0, Height: 0}
+	if dbLen.Valid {
+		p.PackageDimensions.Length = dbLen.Float64
+	}
+	if dbWid.Valid {
+		p.PackageDimensions.Width = dbWid.Float64
+	}
+	if dbHgt.Valid {
+		p.PackageDimensions.Height = dbHgt.Float64
+	}
+
+	// 4. Fetch Linked Categories (Robust)
+	p.CategoryIDs = []int64{} // Init empty
+	catRows, err := h.DB.Query("SELECT category_id FROM product_categories WHERE product_id = ?", p.ID)
+	if err == nil {
+		defer catRows.Close()
+		for catRows.Next() {
+			var cid int64
+			catRows.Scan(&cid)
+			p.CategoryIDs = append(p.CategoryIDs, cid)
+		}
+	}
+
+	// 5. Fetch Brand ID
+	h.DB.QueryRow("SELECT brand_id FROM product_brands WHERE product_id = ?", p.ID).Scan(&p.BrandID)
+
+	// 6. Fetch Variants
+	p.Variants = []VariantInput{} // Init empty
+	if p.IsVariable {
+		vRows, err := h.DB.Query(`
+			SELECT sku, price_to_tts, stock_quantity, options, commission_rate 
+			FROM product_variants WHERE product_id = ?`, p.ID)
+		if err == nil {
+			defer vRows.Close()
+			for vRows.Next() {
+				var v VariantInput
+				var vOpts []byte
+				var vComm sql.NullFloat64
+				var vSku sql.NullString
+
+				vRows.Scan(&vSku, &v.Price, &v.Stock, &vOpts, &vComm)
+
+				json.Unmarshal(vOpts, &v.Options)
+				if vComm.Valid {
+					val := vComm.Float64
+					v.CommissionRate = &val
+				}
+				if vSku.Valid {
+					v.SKU = vSku.String
+				}
+
+				p.Variants = append(p.Variants, v)
+			}
+		}
+	}
+
+	// 7. Return Final JSON
+	c.JSON(http.StatusOK, gin.H{"product": p})
 }
