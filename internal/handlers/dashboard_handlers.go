@@ -136,14 +136,14 @@ func (h *Handlers) GetSupplierStats(c *gin.Context) {
 	c.JSON(http.StatusOK, stats)
 }
 
-//
 // --- Manager Dashboard Stats ---
-//
 
+// Updated to include TotalUsers as per Phase 8.7 plan
 type ManagerStats struct {
 	PendingProducts    int `json:"pendingProducts"`
 	WithdrawalRequests int `json:"withdrawalRequests"`
 	PriceAppeals       int `json:"priceAppeals"`
+	TotalUsers         int `json:"totalUsers"` // [NEW] Track platform growth
 }
 
 // GetManagerStats returns KPI data for the manager dashboard
@@ -169,6 +169,14 @@ func (h *Handlers) GetManagerStats(c *gin.Context) {
 	err = h.DB.QueryRow("SELECT COUNT(*) FROM price_appeals WHERE status = 'pending'").Scan(&stats.PriceAppeals)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to count price appeals"})
+		return
+	}
+
+	// 4. Total Active Users (Dropshippers + Suppliers)
+	// [NEW] We count only active users to give a realistic view of the user base
+	err = h.DB.QueryRow("SELECT COUNT(*) FROM users WHERE status = 'active'").Scan(&stats.TotalUsers)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to count users"})
 		return
 	}
 

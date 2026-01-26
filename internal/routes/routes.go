@@ -144,6 +144,9 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 			manager.GET("/settings", h.GetSettings)
 			manager.PATCH("/settings", h.UpdateSettings)
 
+			manager.GET("/users", h.GetUsers)                        // <--- ADD THIS
+			manager.PATCH("/users/:id/penalty", h.UpdateUserPenalty) // <--- AND THIS
+
 			manager.POST("/users/:id/subscription", h.AssignSubscription)
 			manager.GET("/dashboard-stats", h.GetManagerStats)
 		}

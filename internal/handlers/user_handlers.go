@@ -1,38 +1,39 @@
 package handlers
 
 import (
-	"database/sql" // For our DB connection
-	"log"
-	"net/http" // For HTTP status codes
-	"time"     // For time.Now()
-
-	"io"            // For copying file data
-	"os"            // For creating files and directories
-	"path/filepath" // For creating safe file paths
+	"database/sql"
+	"fmt"
+	"io"
+	"math/rand"
+	"net/http"
+	"os"
+	"path/filepath"
+	"time"
 
 	"github.com/01moynul/taptosell-golang/internal/auth"
-	"github.com/01moynul/taptosell-golang/internal/models" // Our User models
-	"github.com/gin-gonic/gin"                             // The Gin framework
-
-	"fmt"       // For the verification code
-	"math/rand" // For generating the verification code
-
-	"github.com/01moynul/taptosell-golang/internal/email" // Our new email package
+	"github.com/01moynul/taptosell-golang/internal/email"
+	"github.com/01moynul/taptosell-golang/internal/models"
+	"github.com/gin-gonic/gin"
 )
 
-// --- User Registration ---
+// Helper: Converts string to pointer (empty string -> nil)
+func strPtr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
 
-// RegisterUserInput defines the expected JSON data for registration.
-// The 'binding' tags are used by Gin for automatic validation.
+// --- Registration ---
+
 type RegisterUserInput struct {
-	// --- Core Fields (Dropshipper & Supplier) ---
 	FullName    string `json:"fullName" binding:"required"`
 	Email       string `json:"email" binding:"required,email"`
 	Password    string `json:"password" binding:"required,min=8"`
 	PhoneNumber string `json:"phoneNumber" binding:"required"`
 
-	// --- Supplier-Only Fields ---
-	RegistrationKey string `json:"registrationKey"` // Required only for suppliers
+	// Supplier Fields
+	RegistrationKey string `json:"registrationKey"`
 	CompanyName     string `json:"companyName"`
 	ICNumber        string `json:"icNumber"`
 	SSMNumber       string `json:"ssmNumber"`
@@ -43,42 +44,29 @@ type RegisterUserInput struct {
 	Postcode        string `json:"postcode"`
 }
 
-// RegisterDropshipper is the handler for our new endpoint.
 func (h *Handlers) RegisterDropshipper(c *gin.Context) {
-	// 1. --- Define Input ---
 	var input RegisterUserInput
-
-	// 2. --- Bind & Validate JSON ---
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// 3. --- Generate Verification Code ---
-	code, err := generateVerificationCode()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate verification code"})
-		return
-	}
-	// Code expires in 15 minutes
+	code, _ := generateVerificationCode()
 	expiry := time.Now().Add(15 * time.Minute)
 
-	// 4. --- Create User Model ---
 	user := &models.User{
-		Role:        "dropshipper",
-		Status:      "unverified", // <-- CHANGED: New users are now 'unverified'
-		Email:       input.Email,
-		FullName:    input.FullName,
-		PhoneNumber: input.PhoneNumber,
-		CreatedAt:   time.Now(),
-		UpdatedAt:   time.Now(),
-		Version:     1,
-		// --- Set verification fields ---
-		VerificationCode:   sql.NullString{String: code, Valid: true},
-		VerificationExpiry: sql.NullTime{Time: expiry, Valid: true},
+		Role:               "dropshipper",
+		Status:             "unverified",
+		Email:              input.Email,
+		FullName:           input.FullName,
+		PhoneNumber:        input.PhoneNumber,
+		CreatedAt:          time.Now(),
+		UpdatedAt:          time.Now(),
+		Version:            1,
+		VerificationCode:   &code,   // Pointer
+		VerificationExpiry: &expiry, // Pointer
 	}
 
-	// 5. --- Hash the Password ---
 	var password models.Password
 	if err := password.Set(input.Password); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
@@ -86,663 +74,323 @@ func (h *Handlers) RegisterDropshipper(c *gin.Context) {
 	}
 	user.PasswordHash = password.Hash
 
-	// 6. --- Save to Database ---
-	// The query is now much longer to include the new fields
-	query := `
-		INSERT INTO users
-		(role, status, email, password_hash, full_name, phone_number, created_at, updated_at, version, verification_code, verification_expiry)
-		VALUES
-		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	query := `INSERT INTO users (role, status, email, password_hash, full_name, phone_number, created_at, updated_at, version, verification_code, verification_expiry) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
-	args := []interface{}{
-		user.Role,
-		user.Status,
-		user.Email,
-		user.PasswordHash,
-		user.FullName,
-		user.PhoneNumber,
-		user.CreatedAt,
-		user.UpdatedAt,
-		user.Version,
-		user.VerificationCode,
-		user.VerificationExpiry,
-	}
-
-	result, err := h.DB.Exec(query, args...)
+	result, err := h.DB.Exec(query, user.Role, user.Status, user.Email, user.PasswordHash, user.FullName, user.PhoneNumber, user.CreatedAt, user.UpdatedAt, user.Version, user.VerificationCode, user.VerificationExpiry)
 	if err != nil {
-		// We'll add a duplicate email check here later
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to register user"})
 		return
 	}
 
-	id, err := result.LastInsertId()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get new user ID"})
-		return
-	}
+	id, _ := result.LastInsertId()
 	user.ID = id
+	email.SendVerificationEmail(user.Email, code)
 
-	// 7. --- Send Verification Email ---
-	// Use our new (placeholder) email service
-	err = email.SendVerificationEmail(user.Email, code)
-	if err != nil {
-		// If email fails, we should ideally roll back the transaction
-		// For now, we'll just log an error but still tell the user.
-		log.Printf("ERROR: Failed to send verification email to %s: %v\n", user.Email, err)
-	}
-
-	// 8. --- Send Success Response ---
-	// The message is different now, guiding the user to the next step.
-	c.JSON(http.StatusCreated, gin.H{
-		"message": "Registration successful. Please check your email for a verification code.",
-		"user":    user,
-	})
+	c.JSON(http.StatusCreated, gin.H{"message": "Registration successful. Please check your email.", "user": user})
 }
 
-// RegisterSupplier is the handler for the supplier registration endpoint.
 func (h *Handlers) RegisterSupplier(c *gin.Context) {
-	// 1. --- Define Input ---
 	var input RegisterUserInput
-
-	// 2. --- Bind & Validate JSON ---
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// 3. --- VALIDATE REGISTRATION KEY (DYNAMIC) ---
-	// We now fetch the key from the 'settings' table in the database.
 	var correctKey string
-	queryKey := "SELECT setting_value FROM settings WHERE setting_key = 'supplier_registration_key'"
-
-	err := h.DB.QueryRow(queryKey).Scan(&correctKey)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			log.Println("CRITICAL ERROR: 'supplier_registration_key' not found in settings table.")
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not process registration. Service configuration error."})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error while verifying key"})
-		return
-	}
-
-	if input.RegistrationKey != correctKey {
+	err := h.DB.QueryRow("SELECT setting_value FROM settings WHERE setting_key = 'supplier_registration_key'").Scan(&correctKey)
+	if err != nil || input.RegistrationKey != correctKey {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Invalid registration key"})
 		return
 	}
-	// --- END VALIDATION ---
 
-	// 4. --- Generate Verification Code ---
-	code, err := generateVerificationCode()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate verification code"})
-		return
-	}
-	expiry := time.Now().Add(15 * time.Minute) // Code expires in 15 minutes
+	code, _ := generateVerificationCode()
+	expiry := time.Now().Add(15 * time.Minute)
 
-	// 5. --- Create User Model ---
 	user := &models.User{
-		Role:        "supplier",
-		Status:      "unverified", // <-- CHANGED: New users are 'unverified'
-		Email:       input.Email,
-		FullName:    input.FullName,
-		PhoneNumber: input.PhoneNumber,
-		CreatedAt:   time.Now(),
-		UpdatedAt:   time.Now(),
-		Version:     1,
-		// --- Set verification fields ---
-		VerificationCode:   sql.NullString{String: code, Valid: true},
-		VerificationExpiry: sql.NullTime{Time: expiry, Valid: true},
-		// --- Set new supplier-specific fields ---
-		CompanyName:  sql.NullString{String: input.CompanyName, Valid: input.CompanyName != ""},
-		ICNumber:     sql.NullString{String: input.ICNumber, Valid: input.ICNumber != ""},
-		SSMNumber:    sql.NullString{String: input.SSMNumber, Valid: input.SSMNumber != ""},
-		AddressLine1: sql.NullString{String: input.AddressLine1, Valid: input.AddressLine1 != ""},
-		AddressLine2: sql.NullString{String: input.AddressLine2, Valid: input.AddressLine2 != ""},
-		City:         sql.NullString{String: input.City, Valid: input.City != ""},
-		State:        sql.NullString{String: input.State, Valid: input.State != ""},
-		Postcode:     sql.NullString{String: input.Postcode, Valid: input.Postcode != ""},
+		Role:               "supplier",
+		Status:             "unverified",
+		Email:              input.Email,
+		FullName:           input.FullName,
+		PhoneNumber:        input.PhoneNumber,
+		CreatedAt:          time.Now(),
+		UpdatedAt:          time.Now(),
+		Version:            1,
+		VerificationCode:   &code,
+		VerificationExpiry: &expiry,
+
+		// Use helper for clean pointer assignment
+		CompanyName:  strPtr(input.CompanyName),
+		ICNumber:     strPtr(input.ICNumber),
+		SSMNumber:    strPtr(input.SSMNumber),
+		AddressLine1: strPtr(input.AddressLine1),
+		AddressLine2: strPtr(input.AddressLine2),
+		City:         strPtr(input.City),
+		State:        strPtr(input.State),
+		Postcode:     strPtr(input.Postcode),
 	}
 
-	// 6. --- Hash the Password ---
 	var password models.Password
-	if err := password.Set(input.Password); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
-		return
-	}
+	password.Set(input.Password)
 	user.PasswordHash = password.Hash
 
-	// 7. --- Save to Database ---
-	query := `
-		INSERT INTO users
-		(role, status, email, password_hash, full_name, phone_number, created_at, updated_at, version,
-		verification_code, verification_expiry,
-		company_name, ic_number, ssm_number, address_line1, address_line2, city, state, postcode)
-		VALUES
-		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	query := `INSERT INTO users (role, status, email, password_hash, full_name, phone_number, created_at, updated_at, version, verification_code, verification_expiry, company_name, ic_number, ssm_number, address_line1, address_line2, city, state, postcode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
-	args := []interface{}{
-		user.Role,
-		user.Status,
-		user.Email,
-		user.PasswordHash,
-		user.FullName,
-		user.PhoneNumber,
-		user.CreatedAt,
-		user.UpdatedAt,
-		user.Version,
-		user.VerificationCode,
-		user.VerificationExpiry,
-		user.CompanyName,
-		user.ICNumber,
-		user.SSMNumber,
-		user.AddressLine1,
-		user.AddressLine2,
-		user.City,
-		user.State,
-		user.Postcode,
-	}
+	result, err := h.DB.Exec(query, user.Role, user.Status, user.Email, user.PasswordHash, user.FullName, user.PhoneNumber, user.CreatedAt, user.UpdatedAt, user.Version, user.VerificationCode, user.VerificationExpiry, user.CompanyName, user.ICNumber, user.SSMNumber, user.AddressLine1, user.AddressLine2, user.City, user.State, user.Postcode)
 
-	result, err := h.DB.Exec(query, args...)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to register user"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to register supplier"})
 		return
 	}
 
-	id, err := result.LastInsertId()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get new user ID"})
-		return
-	}
+	id, _ := result.LastInsertId()
 	user.ID = id
+	email.SendVerificationEmail(user.Email, code)
 
-	// 8. --- Send Verification Email ---
-	err = email.SendVerificationEmail(user.Email, code)
-	if err != nil {
-		log.Printf("ERROR: Failed to send verification email to %s: %v\n", user.Email, err)
-	}
-
-	// 9. --- Send Success Response ---
-	c.JSON(http.StatusCreated, gin.H{
-		"message": "Supplier registration successful. Please check your email for a verification code.",
-		"user":    user,
-	})
+	c.JSON(http.StatusCreated, gin.H{"message": "Supplier registration successful.", "user": user})
 }
 
-// --- User Login ---
+// --- Login & Verification ---
 
-// LoginInput defines the JSON data expected for a login.
 type LoginInput struct {
 	Email    string `json:"email" binding:"required,email"`
 	Password string `json:"password" binding:"required"`
 }
 
-// Login is the handler for the /v1/login endpoint.
 func (h *Handlers) Login(c *gin.Context) {
-	// 1. --- Define Input ---
 	var input LoginInput
-
-	// 2. --- Bind & Validate JSON ---
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// DEBUG LOG
-	log.Printf("Login Attempt for Email: %s", input.Email)
-
-	// 3. --- Find User By Email ---
 	var user models.User
-	query := "SELECT id, password_hash, role, status FROM users WHERE email = ?"
-
-	err := h.DB.QueryRow(query, input.Email).Scan(
-		&user.ID,
-		&user.PasswordHash,
-		&user.Role,
-		&user.Status,
-	)
-
+	err := h.DB.QueryRow("SELECT id, password_hash, role, status FROM users WHERE email = ?", input.Email).Scan(&user.ID, &user.PasswordHash, &user.Role, &user.Status)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			log.Println("DEBUG: User not found in DB.")
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
-			return
-		}
-		log.Printf("DEBUG: Database error: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
-		return
-	}
-
-	log.Printf("DEBUG: Found User ID: %d, Role: %s, Status: %s", user.ID, user.Role, user.Status)
-
-	// 4. --- CHECK USER STATUS ---
-	switch user.Status {
-	case "unverified":
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Account not verified. Please check your email for a verification code."})
-		return
-	case "pending":
-		c.JSON(http.StatusForbidden, gin.H{"error": "Your account is pending approval by an administrator."})
-		return
-	case "suspended":
-		c.JSON(http.StatusForbidden, gin.H{"error": "Your account has been suspended. Please contact support."})
-		return
-	case "active":
-		// --- MAINTENANCE MODE CHECK ---
-		var maintenanceMode string
-		_ = h.DB.QueryRow("SELECT setting_value FROM settings WHERE setting_key = 'maintenance_mode'").Scan(&maintenanceMode)
-
-		if maintenanceMode == "true" && user.Role != "administrator" {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "⛔ System is in Maintenance Mode. Logins are temporarily disabled."})
-			return
-		}
-		// User is active and allowed, continue to password check...
-
-	default:
-		log.Printf("DEBUG: Unknown status '%s'", user.Status)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Unknown user status"})
-		return
-	}
-
-	// 5. --- Check Password ---
-	var password models.Password
-	password.Hash = user.PasswordHash
-
-	// DEBUG: Check password comparison
-	match, err := password.Matches(input.Password)
-	if err != nil {
-		log.Printf("DEBUG: Password match error: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check password"})
-		return
-	}
-	if !match {
-		log.Println("DEBUG: Password Mismatch.")
-		log.Printf("DEBUG: Hash from DB: %s", user.PasswordHash)
-		log.Printf("DEBUG: Input Password: %s", input.Password)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
 
-	log.Println("DEBUG: Password MATCHED! Generating token...")
-
-	// 6. --- Generate JWT ---
-	token, err := auth.GenerateToken(user.ID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
+	if user.Status == "unverified" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Account not verified."})
+		return
+	}
+	if user.Status == "suspended" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Account suspended."})
 		return
 	}
 
-	// 7. --- Send Success Response ---
-	c.JSON(http.StatusOK, gin.H{
-		"message": "Login successful",
-		"token":   token,
-		"user": gin.H{
-			"id":   user.ID,
-			"role": user.Role,
-		},
-	})
+	var password models.Password
+	password.Hash = user.PasswordHash
+	match, _ := password.Matches(input.Password)
+	if !match {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+		return
+	}
+
+	token, _ := auth.GenerateToken(user.ID)
+	c.JSON(http.StatusOK, gin.H{"message": "Login successful", "token": token, "user": gin.H{"id": user.ID, "role": user.Role}})
 }
 
-// generateVerificationCode creates a simple 6-digit numeric code.
 func generateVerificationCode() (string, error) {
-	// Create a 6-digit code (100000 - 999999)
 	n := 100000 + (int(rand.Intn(900000)))
 	return fmt.Sprintf("%d", n), nil
 }
 
-// --- User Verification ---
-
-// VerifyEmailInput defines the expected JSON for email verification.
 type VerifyEmailInput struct {
 	Email string `json:"email" binding:"required,email"`
 	Code  string `json:"code" binding:"required"`
 }
 
-// VerifyEmail is the handler for the /v1/auth/verify-email endpoint.
 func (h *Handlers) VerifyEmail(c *gin.Context) {
-	// 1. --- Define Input ---
 	var input VerifyEmailInput
-
-	// 2. --- Bind & Validate JSON ---
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// 3. --- Find User By Email ---
 	var user models.User
-	query := "SELECT id, status, verification_code, verification_expiry FROM users WHERE email = ?"
-
-	// Get the user's current data
-	err := h.DB.QueryRow(query, input.Email).Scan(
-		&user.ID,
-		&user.Status,
-		&user.VerificationCode,
-		&user.VerificationExpiry,
-	)
-
+	// Scan directly into pointers
+	err := h.DB.QueryRow("SELECT id, status, verification_code, verification_expiry FROM users WHERE email = ?", input.Email).Scan(&user.ID, &user.Status, &user.VerificationCode, &user.VerificationExpiry)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 		return
 	}
 
-	// 4. --- Check Status ---
 	if user.Status != "unverified" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Account is already verified or in an invalid state."})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Already verified"})
 		return
 	}
 
-	// 5. --- Check Code & Expiry ---
-	// Check if code or expiry are NULL (invalid state)
-	if !user.VerificationCode.Valid || !user.VerificationExpiry.Valid {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "No verification code found for this user."})
+	// Safety check for nil pointers
+	if user.VerificationCode == nil || user.VerificationExpiry == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No code found"})
 		return
 	}
-	// Check if code matches
-	if user.VerificationCode.String != input.Code {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid verification code."})
+	if *user.VerificationCode != input.Code {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid code"})
 		return
 	}
-	// Check if expired
-	if time.Now().After(user.VerificationExpiry.Time) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Verification code has expired."})
+	if time.Now().After(*user.VerificationExpiry) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Code expired"})
 		return
 	}
 
-	// 6. --- SUCCESS: Update User ---
-	// Set status to 'pending' (ready for admin approval)
-	// Set verification fields to NULL to clean up.
-	updateQuery := `
-		UPDATE users
-		SET status = 'pending', verification_code = NULL, verification_expiry = NULL, updated_at = ?
-		WHERE id = ?`
-
-	_, err = h.DB.Exec(updateQuery, time.Now(), user.ID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update user status"})
-		return
-	}
-
-	// 7. --- Send Success Response ---
-	c.JSON(http.StatusOK, gin.H{
-		"message": "Email verified successfully. Your account is now pending administrator approval.",
-	})
+	h.DB.Exec("UPDATE users SET status = 'pending', verification_code = NULL, verification_expiry = NULL WHERE id = ?", user.ID)
+	c.JSON(http.StatusOK, gin.H{"message": "Email verified."})
 }
 
-// ResendVerificationEmailInput defines the JSON for resending a code.
 type ResendVerificationEmailInput struct {
 	Email string `json:"email" binding:"required,email"`
 }
 
-// ResendVerificationEmail is the handler for /v1/auth/resend-code
 func (h *Handlers) ResendVerificationEmail(c *gin.Context) {
-	// 1. --- Define Input ---
 	var input ResendVerificationEmailInput
-
-	// 2. --- Bind & Validate JSON ---
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-
-	// 3. --- Find User ---
 	var user models.User
-	query := "SELECT id, status FROM users WHERE email = ?"
-	err := h.DB.QueryRow(query, input.Email).Scan(&user.ID, &user.Status)
-
-	if err != nil {
-		if err == sql.ErrNoRows {
-			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+	if err := h.DB.QueryRow("SELECT id, status FROM users WHERE email = ?", input.Email).Scan(&user.ID, &user.Status); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 		return
 	}
-
-	// 4. --- Check Status ---
 	if user.Status != "unverified" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "This account is already verified."})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Already verified"})
 		return
 	}
-
-	// 5. --- Generate New Code & Expiry ---
-	code, err := generateVerificationCode()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate code"})
-		return
-	}
+	code, _ := generateVerificationCode()
 	expiry := time.Now().Add(15 * time.Minute)
-
-	// 6. --- Update User in DB ---
-	updateQuery := `
-		UPDATE users
-		SET verification_code = ?, verification_expiry = ?, updated_at = ?
-		WHERE id = ?`
-
-	_, err = h.DB.Exec(updateQuery, code, expiry, time.Now(), user.ID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update verification code"})
-		return
-	}
-
-	// 7. --- Send New Email ---
-	err = email.SendVerificationEmail(input.Email, code)
-	if err != nil {
-		log.Printf("ERROR: Failed to resend verification email to %s: %v\n", input.Email, err)
-	}
-
-	// 8. --- Send Success Response ---
-	c.JSON(http.StatusOK, gin.H{
-		"message": "A new verification code has been sent to your email.",
-	})
+	h.DB.Exec("UPDATE users SET verification_code = ?, verification_expiry = ? WHERE id = ?", code, expiry, user.ID)
+	email.SendVerificationEmail(input.Email, code)
+	c.JSON(http.StatusOK, gin.H{"message": "New code sent."})
 }
 
-// --- Supplier Document Upload ---
+// --- Uploads ---
 
-// UploadSupplierDocuments handles the multipart/form-data upload for SSM and Bank Statements.
-// This is a protected route, so it will have access to the "userID" from the auth middleware.
 func (h *Handlers) UploadSupplierDocuments(c *gin.Context) {
-	// 1. --- Get UserID from Middleware ---
-	// We know this user is authenticated because this route will be protected.
-	userID_raw, exists := c.Get("userID")
-	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "User ID not found in context"})
-		return
-	}
-	userID := userID_raw.(int64) // Cast the userID to int64
-
-	// 2. --- Verify User is a Supplier ---
-	// (We'll add this check for extra security, though a 'pending' user can't log in yet)
-	// For now, we'll assume the user is the correct one.
-	// In a future step, we'd query the DB to check role:
-	// var userRole string
-	// h.DB.QueryRow("SELECT role FROM users WHERE id = ?", userID).Scan(&userRole)
-	// if userRole != "supplier" { ... }
-
-	// 3. --- Ensure Uploads Directory Exists ---
-	// We'll save files to a folder named 'uploads' in our project root.
+	userID_raw, _ := c.Get("userID")
+	userID := userID_raw.(int64)
 	uploadDir := "./uploads"
-	if err := os.MkdirAll(uploadDir, os.ModePerm); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create upload directory"})
-		return
-	}
+	os.MkdirAll(uploadDir, os.ModePerm)
 
-	// 4. --- Process Files ---
-	// We will store the paths to update the DB
-	var ssmDocPath string
-	var bankStmtPath string
-
-	// Create a map to update the DB
-	dbUpdateMap := make(map[string]string)
-
-	// Helper function to save a file
-	saveFile := func(formFileName string, dbColumnName string) error {
-		file, header, err := c.Request.FormFile(formFileName)
+	saveFile := func(name string) string {
+		file, header, err := c.Request.FormFile(name)
 		if err != nil {
-			// http.ErrMissingFile means the user just didn't upload this one, which is fine.
-			if err == http.ErrMissingFile {
-				return nil
-			}
-			return err
+			return ""
 		}
 		defer file.Close()
-
-		// Create a safe, unique filename
-		// e.g., "uploads/123-ssm_document-original_filename.pdf"
-		safeFilename := fmt.Sprintf("%d-%s-%s", userID, formFileName, filepath.Base(header.Filename))
-		targetPath := filepath.Join(uploadDir, safeFilename)
-
-		// Create the destination file
-		dst, err := os.Create(targetPath)
-		if err != nil {
-			return err
-		}
+		path := filepath.Join(uploadDir, fmt.Sprintf("%d-%s-%s", userID, name, filepath.Base(header.Filename)))
+		dst, _ := os.Create(path)
 		defer dst.Close()
+		io.Copy(dst, file)
+		return path
+	}
 
-		// Copy the uploaded file data to the destination file
-		if _, err := io.Copy(dst, file); err != nil {
-			return err
+	ssm := saveFile("ssm_document")
+	bank := saveFile("bank_statement")
+
+	if ssm != "" {
+		h.DB.Exec("UPDATE users SET ssm_document_url = ? WHERE id = ?", ssm, userID)
+	}
+	if bank != "" {
+		h.DB.Exec("UPDATE users SET bank_statement_url = ? WHERE id = ?", bank, userID)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Uploaded"})
+}
+
+// --- Manager Functions ---
+
+// GetUsers returns all users
+// GET /v1/manager/users
+func (h *Handlers) GetUsers(c *gin.Context) {
+	query := `SELECT id, role, status, email, full_name, phone_number, penalty_strikes, created_at FROM users ORDER BY id DESC`
+	rows, err := h.DB.Query(query)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "DB error"})
+		return
+	}
+	defer rows.Close()
+
+	var users []*models.User
+	for rows.Next() {
+		var u models.User
+		var penaltyStrikes sql.NullInt64
+
+		// [FIX] Scanning pointers matches the updated User struct
+		if err := rows.Scan(&u.ID, &u.Role, &u.Status, &u.Email, &u.FullName, &u.PhoneNumber, &penaltyStrikes, &u.CreatedAt); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Scan error"})
+			return
 		}
 
-		// Store the path for our DB update
-		dbUpdateMap[dbColumnName] = targetPath
-		return nil
+		// Handle Nullable Int logic separately (since struct field is int, not *int)
+		if penaltyStrikes.Valid {
+			u.PenaltyStrikes = int(penaltyStrikes.Int64)
+		} else {
+			u.PenaltyStrikes = 0
+		}
+
+		users = append(users, &u)
 	}
-
-	// 5. --- Save the files from the form ---
-	if err := saveFile("ssm_document", "ssm_document_url"); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to save ssm_document: %v", err)})
-		return
-	}
-	if err := saveFile("bank_statement", "bank_statement_url"); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to save bank_statement: %v", err)})
-		return
-	}
-
-	if len(dbUpdateMap) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "No files were uploaded"})
-		return
-	}
-
-	// 6. --- Update User in Database ---
-	// This query is a bit dynamic.
-	// We build the "SET" part of the query based on which files were uploaded.
-	queryArgs := []interface{}{time.Now()}
-	querySet := "updated_at = ?"
-
-	if path, ok := dbUpdateMap["ssm_document_url"]; ok {
-		querySet += ", ssm_document_url = ?"
-		queryArgs = append(queryArgs, path)
-		ssmDocPath = path
-	}
-	if path, ok := dbUpdateMap["bank_statement_url"]; ok {
-		querySet += ", bank_statement_url = ?"
-		queryArgs = append(queryArgs, path)
-		bankStmtPath = path
-	}
-
-	// Add the userID as the final argument for the WHERE clause
-	queryArgs = append(queryArgs, userID)
-
-	query := fmt.Sprintf("UPDATE users SET %s WHERE id = ?", querySet)
-
-	_, err := h.DB.Exec(query, queryArgs...)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update user document paths"})
-		return
-	}
-
-	// 7. --- Send Success Response ---
-	c.JSON(http.StatusOK, gin.H{
-		"message":            "Documents uploaded successfully.",
-		"ssm_document_url":   ssmDocPath,
-		"bank_statement_url": bankStmtPath,
-	})
+	c.JSON(http.StatusOK, gin.H{"users": users})
 }
 
-//
-// --- Super Admin Handlers ---
-//
-
-// CreateManagerInput defines the JSON for creating a manager
-type CreateManagerInput struct {
-	FullName    string `json:"fullName" binding:"required"`
-	Email       string `json:"email" binding:"required,email"`
-	Password    string `json:"password" binding:"required,min=8"`
-	PhoneNumber string `json:"phoneNumber" binding:"required"`
+type UpdateUserPenaltyInput struct {
+	Action string `json:"action" binding:"required,oneof=increment decrement reset"`
 }
 
-// CreateManager is the handler for POST /v1/admin/create-manager
-// It is protected by SuperAdminMiddleware.
-func (h *Handlers) CreateManager(c *gin.Context) {
-	// 1. --- Define Input ---
-	var input CreateManagerInput
-
-	// 2. --- Bind & Validate JSON ---
+// UpdateUserPenalty
+func (h *Handlers) UpdateUserPenalty(c *gin.Context) {
+	id := c.Param("id")
+	var input UpdateUserPenaltyInput
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// 3. --- Create User Model ---
-	user := &models.User{
-		Role:        "manager", // Set role to 'manager'
-		Status:      "active",  // Set status directly to 'active'
-		Email:       input.Email,
-		FullName:    input.FullName,
-		PhoneNumber: input.PhoneNumber,
-		CreatedAt:   time.Now(),
-		UpdatedAt:   time.Now(),
-		Version:     1,
+	var current int
+	h.DB.QueryRow("SELECT COALESCE(penalty_strikes, 0) FROM users WHERE id = ?", id).Scan(&current)
+
+	if input.Action == "increment" {
+		current++
+	}
+	if input.Action == "decrement" && current > 0 {
+		current--
+	}
+	if input.Action == "reset" {
+		current = 0
 	}
 
-	// 4. --- Hash the Password ---
-	var password models.Password
-	if err := password.Set(input.Password); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
+	h.DB.Exec("UPDATE users SET penalty_strikes = ? WHERE id = ?", current, id)
+	c.JSON(http.StatusOK, gin.H{"message": "Penalty updated"})
+}
+
+// --- Admin ---
+type CreateManagerInput struct {
+	FullName    string `json:"fullName"`
+	Email       string `json:"email"`
+	Password    string `json:"password"`
+	PhoneNumber string `json:"phoneNumber"`
+}
+
+func (h *Handlers) CreateManager(c *gin.Context) {
+	var input CreateManagerInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+
+	user := &models.User{
+		Role: "manager", Status: "active", Email: input.Email, FullName: input.FullName, PhoneNumber: input.PhoneNumber, CreatedAt: time.Now(), UpdatedAt: time.Now(), Version: 1,
+	}
+	var password models.Password
+	password.Set(input.Password)
 	user.PasswordHash = password.Hash
 
-	// 5. --- Save to Database ---
-	query := `
-		INSERT INTO users
-		(role, status, email, password_hash, full_name, phone_number, created_at, updated_at, version)
-		VALUES
-		(?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	res, _ := h.DB.Exec("INSERT INTO users (role, status, email, password_hash, full_name, phone_number, created_at, updated_at, version) VALUES (?,?,?,?,?,?,?,?,?)",
+		user.Role, user.Status, user.Email, user.PasswordHash, user.FullName, user.PhoneNumber, user.CreatedAt, user.UpdatedAt, user.Version)
 
-	args := []interface{}{
-		user.Role,
-		user.Status,
-		user.Email,
-		user.PasswordHash,
-		user.FullName,
-		user.PhoneNumber,
-		user.CreatedAt,
-		user.UpdatedAt,
-		user.Version,
-	}
-
-	result, err := h.DB.Exec(query, args...)
-	if err != nil {
-		// Handle potential duplicate email error
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create manager account. Email may already be in use."})
-		return
-	}
-
-	id, err := result.LastInsertId()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get new user ID"})
-		return
-	}
+	id, _ := res.LastInsertId()
 	user.ID = id
-
-	// 6. --- Send Success Response ---
-	c.JSON(http.StatusCreated, gin.H{
-		"message": "Manager account created successfully.",
-		"user":    user,
-	})
+	c.JSON(http.StatusCreated, gin.H{"message": "Manager created", "user": user})
 }
