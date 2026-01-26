@@ -109,8 +109,10 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 			// --- Supplier Inventory ---
 			supplierInventory := auth.Group("/supplier/inventory")
 			{
-				supplierInventory.POST("/", h.CreateInventoryItem)
-				supplierInventory.GET("/", h.GetMyInventoryItems)
+				// [FIX] Use empty string "" instead of "/" to match the frontend URL exactly
+				supplierInventory.POST("", h.CreateInventoryItem)
+				supplierInventory.GET("", h.GetMyInventoryItems)
+
 				supplierInventory.PUT("/:id", h.UpdateInventoryItem)
 				supplierInventory.DELETE("/:id", h.DeleteInventoryItem)
 				supplierInventory.POST("/:id/promote", h.PromoteInventoryItem)
