@@ -1,67 +1,69 @@
 package models
 
 import (
-	"database/sql"
 	"time"
 )
 
 // Product is the model for the 'products' table.
+// [FIX]: Switched sql.Null* types to Pointers (*string, *float64) for clean JSON serialization.
 type Product struct {
-	ID          int64          `json:"id" db:"id"`
-	SupplierID  int64          `json:"supplierId" db:"supplier_id"`
-	SKU         sql.NullString `json:"sku,omitempty" db:"sku"`
-	Name        string         `json:"name" db:"name"`
-	Description string         `json:"description" db:"description"`
+	ID          int64   `json:"id" db:"id"`
+	SupplierID  int64   `json:"supplierId" db:"supplier_id"`
+	SKU         *string `json:"sku,omitempty" db:"sku"` // Changed from sql.NullString
+	Name        string  `json:"name" db:"name"`
+	Description string  `json:"description" db:"description"`
 
 	// --- Pricing & Stock ---
 	PriceToTTS    float64 `json:"price" db:"price_to_tts"`
 	StockQuantity int     `json:"stock" db:"stock_quantity"`
-	SRP           float64 `json:"srp" db:"srp"` // Changed from sql.NullFloat64 to float64 for simplicity in JSON
+	SRP           float64 `json:"srp" db:"srp"`
 
 	// --- Configuration ---
-	IsVariable     bool            `json:"isVariable" db:"is_variable"`
-	Status         string          `json:"status" db:"status"`
-	CommissionRate sql.NullFloat64 `json:"commissionRate,omitempty" db:"commission_rate"`
+	IsVariable     bool     `json:"isVariable" db:"is_variable"`
+	Status         string   `json:"status" db:"status"`
+	CommissionRate *float64 `json:"commissionRate,omitempty" db:"commission_rate"` // Changed from sql.NullFloat64
 
-	// --- Media & Content (UPDATED to support JSON Arrays) ---
-	// NOTE: We changed these from sql.NullString to their actual Go types ([]string, map, etc.)
-	// The Handler manually scans the DB JSON into these fields.
-	Images          []string               `json:"images"`   // Now a real array!
-	VideoURL        string                 `json:"videoUrl"` // Now a real string
+	// --- Media & Content ---
+	Images          []string               `json:"images"`
+	VideoURL        string                 `json:"videoUrl"`
 	VideoStatus     string                 `json:"videoStatus" db:"video_status"`
-	SizeChart       map[string]interface{} `json:"sizeChart"`       // Now a real Object
-	VariationImages map[string]string      `json:"variationImages"` // Now a real Map
+	SizeChart       map[string]interface{} `json:"sizeChart"`
+	VariationImages map[string]string      `json:"variationImages"`
 
 	// --- Shipping ---
-	Weight      sql.NullFloat64 `json:"weight,omitempty" db:"weight"`
-	WeightGrams int             `json:"weightGrams" db:"weight_grams"`
-	PkgLength   sql.NullFloat64 `json:"pkgLength,omitempty" db:"pkg_length"`
-	PkgWidth    sql.NullFloat64 `json:"pkgWidth,omitempty" db:"pkg_width"`
-	PkgHeight   sql.NullFloat64 `json:"pkgHeight,omitempty" db:"pkg_height"`
+	Weight      *float64 `json:"weight,omitempty" db:"weight"` // Changed from sql.NullFloat64
+	WeightGrams int      `json:"weightGrams" db:"weight_grams"`
+	PkgLength   *float64 `json:"pkgLength,omitempty" db:"pkg_length"` // Changed from sql.NullFloat64
+	PkgWidth    *float64 `json:"pkgWidth,omitempty" db:"pkg_width"`   // Changed from sql.NullFloat64
+	PkgHeight   *float64 `json:"pkgHeight,omitempty" db:"pkg_height"` // Changed from sql.NullFloat64
 
 	CreatedAt time.Time `json:"createdAt" db:"created_at"`
 	UpdatedAt time.Time `json:"updatedAt" db:"updated_at"`
 
-	// Joins
+	// Joins (Not in DB table, populated manually)
 	Categories []Category       `json:"categories,omitempty" db:"-"`
 	Brands     []Brand          `json:"brands,omitempty" db:"-"`
 	Variants   []ProductVariant `json:"variants,omitempty" db:"-"`
+
+	// Flattened fields for UI convenience (populated manually if needed)
+	SupplierName string `json:"supplierName,omitempty" db:"-"`
 }
 
-// ProductVariant remains unchanged...
+// ProductVariantOption defines the structure for variant options JSON
 type ProductVariantOption struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
 }
 
+// ProductVariant is the model for the 'product_variants' table
 type ProductVariant struct {
-	ID             int64           `json:"id" db:"id"`
-	ProductID      int64           `json:"productId" db:"product_id"`
-	SKU            sql.NullString  `json:"sku,omitempty" db:"sku"`
-	PriceToTTS     float64         `json:"price" db:"price_to_tts"`
-	StockQuantity  int             `json:"stock" db:"stock_quantity"`
-	Options        string          `json:"options" db:"options"`
-	CommissionRate sql.NullFloat64 `json:"commissionRate,omitempty" db:"commission_rate"`
-	CreatedAt      time.Time       `json:"createdAt" db:"created_at"`
-	UpdatedAt      time.Time       `json:"updatedAt" db:"updated_at"`
+	ID             int64     `json:"id" db:"id"`
+	ProductID      int64     `json:"productId" db:"product_id"`
+	SKU            *string   `json:"sku,omitempty" db:"sku"` // Changed from sql.NullString
+	PriceToTTS     float64   `json:"price" db:"price_to_tts"`
+	StockQuantity  int       `json:"stock" db:"stock_quantity"`
+	Options        string    `json:"options" db:"options"`                          // Stored as JSON string in DB
+	CommissionRate *float64  `json:"commissionRate,omitempty" db:"commission_rate"` // Changed from sql.NullFloat64
+	CreatedAt      time.Time `json:"createdAt" db:"created_at"`
+	UpdatedAt      time.Time `json:"updatedAt" db:"updated_at"`
 }

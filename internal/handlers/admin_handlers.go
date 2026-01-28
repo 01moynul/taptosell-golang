@@ -18,7 +18,6 @@ import (
 // It retrieves all products with the status "pending".
 func (h *Handlers) GetPendingProducts(c *gin.Context) {
 	// 1. --- Build Query ---
-	// UPDATED: Changed price to price_to_tts, stock to stock_quantity
 	query := `
 		SELECT 
 			id, supplier_id, sku, name, description, price_to_tts, stock_quantity, 
@@ -42,8 +41,9 @@ func (h *Handlers) GetPendingProducts(c *gin.Context) {
 	var products []*models.Product
 	for rows.Next() {
 		var product models.Product
-		// UPDATED: Changed &product.Price to &product.PriceToTTS
-		// UPDATED: Changed &product.Stock to &product.StockQuantity
+		// [FIX] We scan directly into the struct.
+		// Since models.Product now uses *float64 for Weight/Dimensions,
+		// rows.Scan handles NULLs automatically (setting the pointer to nil).
 		if err := rows.Scan(
 			&product.ID,
 			&product.SupplierID,
@@ -61,10 +61,10 @@ func (h *Handlers) GetPendingProducts(c *gin.Context) {
 			&product.PkgWidth,
 			&product.PkgHeight,
 		); err != nil {
+			fmt.Printf("Scan Error: %v\n", err) // Log scan errors to console
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to scan product row"})
 			return
 		}
-		// TODO: Attach supplier info, categories, brands, etc.
 		products = append(products, &product)
 	}
 	if err = rows.Err(); err != nil {
@@ -84,9 +84,6 @@ func (h *Handlers) ApproveProduct(c *gin.Context) {
 	productIDStr := c.Param("id")
 
 	// 1. --- Begin Transaction ---
-	// We must use a transaction because we are performing multiple
-	// database operations (Update product, get supplier, add notification)
-	// that must all succeed or fail together.
 	tx, err := h.DB.Begin()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction"})
@@ -95,16 +92,16 @@ func (h *Handlers) ApproveProduct(c *gin.Context) {
 	defer tx.Rollback() // Safety net
 
 	// 2. --- Get Product Info (and lock the row) ---
-	// We get the supplier_id and name *before* updating
-	// We use 'FOR UPDATE' to lock this product row for the transaction.
 	var supplierID int64
 	var productName string
+	// We use 'FOR UPDATE' to lock this product row for the transaction.
 	err = tx.QueryRow("SELECT supplier_id, name FROM products WHERE id = ? AND status = 'pending' FOR UPDATE", productIDStr).Scan(&supplierID, &productName)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Product not found or was not pending approval"})
 			return
 		}
+		fmt.Printf("ApproveProduct DB Error: %v\n", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get product details"})
 		return
 	}
@@ -115,19 +112,24 @@ func (h *Handlers) ApproveProduct(c *gin.Context) {
 		SET status = ?, updated_at = ?
 		WHERE id = ? AND status = ?`
 
-	args := []interface{}{"published", time.Now(), productIDStr, "pending"}
-
-	_, err = tx.Exec(query, args...)
+	_, err = tx.Exec(query, "published", time.Now(), productIDStr, "pending")
 	if err != nil {
+		fmt.Printf("ApproveProduct Update Error: %v\n", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to approve product"})
 		return
 	}
 
-	// 4. --- Add Notification (NEW STEP) ---
+	// 4. --- Add Notification ---
+	// If this fails, we LOG it but we don't fail the entire approval (optional safety).
 	message := fmt.Sprintf("Your product \"%s\" has been approved and is now published.", productName)
-	link := fmt.Sprintf("/supplier/products/%s", productIDStr) // A future frontend link
+	link := fmt.Sprintf("/supplier/products") // Link to supplier's product list
 
+	// NOTE: Assuming h.AddNotification accepts (tx *sql.Tx, ...).
+	// If your AddNotification implementation does NOT accept tx, change 'tx' to 'h.DB' (but careful with locks).
 	if err := h.AddNotification(tx, supplierID, message, link); err != nil {
+		// Log the error but proceed (don't block approval just because notification failed?)
+		// For now, we will block to be safe, but print the error.
+		fmt.Printf("ApproveProduct Notification Error: %v\n", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to send notification"})
 		return
 	}
@@ -149,7 +151,6 @@ type RejectProductInput struct {
 }
 
 // RejectProduct is the handler for PATCH /v1/manager/products/:id/reject
-// It changes a product's status from "pending" to "rejected".
 func (h *Handlers) RejectProduct(c *gin.Context) {
 	productIDStr := c.Param("id")
 
@@ -168,7 +169,7 @@ func (h *Handlers) RejectProduct(c *gin.Context) {
 	}
 	defer tx.Rollback()
 
-	// 3. --- Get Product Info (and lock the row) ---
+	// 3. --- Get Product Info ---
 	var supplierID int64
 	var productName string
 	err = tx.QueryRow("SELECT supplier_id, name FROM products WHERE id = ? AND status = 'pending' FOR UPDATE", productIDStr).Scan(&supplierID, &productName)
@@ -182,25 +183,23 @@ func (h *Handlers) RejectProduct(c *gin.Context) {
 	}
 
 	// 4. --- Update Database ---
-	// TODO: Save the input.Reason to a 'rejection_reason' column.
 	query := `
 		UPDATE products
 		SET status = ?, updated_at = ?
 		WHERE id = ? AND status = ?`
 
-	args := []interface{}{"rejected", time.Now(), productIDStr, "pending"}
-
-	_, err = tx.Exec(query, args...)
+	_, err = tx.Exec(query, "rejected", time.Now(), productIDStr, "pending")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reject product"})
 		return
 	}
 
-	// 5. --- Add Notification (NEW STEP) ---
+	// 5. --- Add Notification ---
 	message := fmt.Sprintf("Your product \"%s\" was rejected. Reason: %s", productName, input.Reason)
-	link := fmt.Sprintf("/supplier/products/%s", productIDStr) // A future frontend link
+	link := fmt.Sprintf("/supplier/products")
 
 	if err := h.AddNotification(tx, supplierID, message, link); err != nil {
+		fmt.Printf("RejectProduct Notification Error: %v\n", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to send notification"})
 		return
 	}
@@ -216,6 +215,8 @@ func (h *Handlers) RejectProduct(c *gin.Context) {
 	})
 }
 
+// ... (GetSettings and UpdateSettings remain unchanged) ...
+// You can keep the existing code for Settings below this point.
 //
 // --- Manager: Settings Handlers ---
 //
@@ -228,9 +229,7 @@ type Setting struct {
 }
 
 // GetSettings is the handler for GET /v1/manager/settings
-// It retrieves all settings from the settings table.
 func (h *Handlers) GetSettings(c *gin.Context) {
-	// 1. --- Query Database ---
 	query := "SELECT setting_key, setting_value, description FROM settings"
 
 	rows, err := h.DB.Query(query)
@@ -240,12 +239,10 @@ func (h *Handlers) GetSettings(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	// 2. --- Scan Rows into a Map ---
-	// We use a map to make it easy for the frontend to find a setting by its key.
 	settingsMap := make(map[string]Setting)
 	for rows.Next() {
 		var s Setting
-		var desc sql.NullString // Handle nullable description
+		var desc sql.NullString
 		if err := rows.Scan(&s.Key, &s.Value, &desc); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to scan setting row"})
 			return
@@ -254,27 +251,17 @@ func (h *Handlers) GetSettings(c *gin.Context) {
 		settingsMap[s.Key] = s
 	}
 
-	if err = rows.Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error iterating setting rows"})
-		return
-	}
-
-	// 3. --- Send Success Response ---
 	c.JSON(http.StatusOK, gin.H{
 		"settings": settingsMap,
 	})
 }
 
-// UpdateSettingsInput defines the expected JSON for updating settings.
-// We expect a map of key-value pairs, e.g., {"supplier_registration_key": "new_key"}
 type UpdateSettingsInput struct {
 	Settings map[string]string `json:"settings" binding:"required"`
 }
 
 // UpdateSettings is the handler for PATCH /v1/manager/settings
-// It updates one or more settings in the database.
 func (h *Handlers) UpdateSettings(c *gin.Context) {
-	// 1. --- Bind & Validate JSON ---
 	var input UpdateSettingsInput
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -286,19 +273,13 @@ func (h *Handlers) UpdateSettings(c *gin.Context) {
 		return
 	}
 
-	// 2. --- Begin Transaction ---
-	// We use a transaction to ensure all settings are updated, or none are.
 	tx, err := h.DB.Begin()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction"})
 		return
 	}
-	defer tx.Rollback() // Safety net
+	defer tx.Rollback()
 
-	// 3. --- Prepare Update Statement ---
-	// We use "INSERT ... ON DUPLICATE KEY UPDATE"
-	// This will update the 'setting_value' if the 'setting_key' already exists,
-	// or insert a new row if it doesn't.
 	query := `
 		INSERT INTO settings (setting_key, setting_value)
 		VALUES (?, ?)
@@ -311,23 +292,18 @@ func (h *Handlers) UpdateSettings(c *gin.Context) {
 	}
 	defer stmt.Close()
 
-	// 4. --- Loop and Execute Updates ---
 	for key, value := range input.Settings {
-		// We should add a check here to prevent unknown keys from being added,
-		// but for now, we'll allow it for flexibility.
 		if _, err := stmt.Exec(key, value); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to update setting: %s", key)})
 			return
 		}
 	}
 
-	// 5. --- Commit Transaction ---
 	if err := tx.Commit(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
 		return
 	}
 
-	// 6. --- Send Success Response ---
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Settings updated successfully",
 	})

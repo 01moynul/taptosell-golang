@@ -81,7 +81,6 @@ func (h *Handlers) CreateProduct(c *gin.Context) {
 	// --- 1. Validation Logic ---
 	isDraft := input.Status == "draft" || input.Status == "private_inventory"
 	if !isDraft {
-		// STRICT VALIDATION for Pending/Active
 		if input.Description == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Description is required for submission."})
 			return
@@ -94,7 +93,6 @@ func (h *Handlers) CreateProduct(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Brand is required."})
 			return
 		}
-		// NEW: Image Validation
 		if len(input.Images) == 0 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "At least 1 product image is required."})
 			return
@@ -135,17 +133,11 @@ func (h *Handlers) CreateProduct(c *gin.Context) {
 	}
 
 	// --- 3. Prepare JSON Data ---
-	// We marshal the arrays/maps to strings for the DB
 	imagesJSON, _ := json.Marshal(input.Images)
 	sizeChartJSON, _ := json.Marshal(input.SizeChart)
 	variationImagesJSON, _ := json.Marshal(input.VariationImages)
 
-	var videoURL sql.NullString
-	if input.VideoURL != "" {
-		videoURL = sql.NullString{String: input.VideoURL, Valid: true}
-	}
-
-	// --- 4. Prepare Product Data (Fixed) ---
+	// --- 4. Prepare Product Data ---
 	product := &models.Product{
 		SupplierID:  supplierID,
 		Name:        input.Name,
@@ -154,30 +146,32 @@ func (h *Handlers) CreateProduct(c *gin.Context) {
 		Status:      input.Status,
 		CreatedAt:   time.Now(),
 		UpdatedAt:   time.Now(),
+		Images:      input.Images,
 	}
 
-	// Logic for Price, Stock, Legacy Columns
 	var srp float64 = 0
 	var weightGrams int = 0
 	var categoryLegacy string = "Uncategorized"
 
-	var commissionRate sql.NullFloat64
-
-	// Initialize defaults
-	product.PriceToTTS = 0
-	product.StockQuantity = 0
+	// [FIX]: Pointers for new Model
+	var commissionRate *float64
+	var sku *string
 
 	if !input.IsVariable && input.SimpleProduct != nil {
 		// SIMPLE PRODUCT
 		product.PriceToTTS = input.SimpleProduct.Price
 		product.StockQuantity = input.SimpleProduct.Stock
-		product.SKU = sql.NullString{String: input.SimpleProduct.SKU, Valid: input.SimpleProduct.SKU != ""}
-		srp = input.SimpleProduct.SRP
-		if input.SimpleProduct.CommissionRate != nil {
-			commissionRate = sql.NullFloat64{Float64: *input.SimpleProduct.CommissionRate, Valid: true}
+
+		// Assign pointers directly (No sql.NullString needed!)
+		if input.SimpleProduct.SKU != "" {
+			val := input.SimpleProduct.SKU
+			sku = &val
 		}
+		srp = input.SimpleProduct.SRP
+		commissionRate = input.SimpleProduct.CommissionRate
+
 	} else if input.IsVariable && len(input.Variants) > 0 {
-		// VARIABLE PRODUCT: Roll-up logic (Fixes Dashboard Zeros)
+		// VARIABLE PRODUCT: Roll-up logic
 		var totalStock int
 		var minPrice float64 = input.Variants[0].Price
 
@@ -187,26 +181,28 @@ func (h *Handlers) CreateProduct(c *gin.Context) {
 				minPrice = v.Price
 			}
 		}
-
 		product.PriceToTTS = minPrice
 		product.StockQuantity = totalStock
-
-		if input.CommissionRate != nil {
-			commissionRate = sql.NullFloat64{Float64: *input.CommissionRate, Valid: true}
-		}
+		commissionRate = input.CommissionRate
 	}
-	product.CommissionRate = commissionRate
 
-	// --- DEFINING THE MISSING VARIABLES HERE ---
-	var weight, pkgLength, pkgWidth, pkgHeight sql.NullFloat64
+	// Assign Pointers directly
+	product.CommissionRate = commissionRate
+	product.SKU = sku
+
+	// Dimensions (Direct Pointers)
+	var pkgLength, pkgWidth, pkgHeight *float64
 	if input.Weight != nil {
-		weight = sql.NullFloat64{Float64: *input.Weight, Valid: true}
+		product.Weight = input.Weight
 		weightGrams = int(*input.Weight * 1000)
 	}
 	if input.PackageDimensions != nil {
-		pkgLength = sql.NullFloat64{Float64: input.PackageDimensions.Length, Valid: true}
-		pkgWidth = sql.NullFloat64{Float64: input.PackageDimensions.Width, Valid: true}
-		pkgHeight = sql.NullFloat64{Float64: input.PackageDimensions.Height, Valid: true}
+		l := input.PackageDimensions.Length
+		w := input.PackageDimensions.Width
+		h := input.PackageDimensions.Height
+		pkgLength = &l
+		pkgWidth = &w
+		pkgHeight = &h
 	}
 
 	// --- 5. INSERT QUERY ---
@@ -219,13 +215,14 @@ func (h *Handlers) CreateProduct(c *gin.Context) {
 		images, video_url, size_chart, variation_images) 
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
+	// [FIX]: Passing pointers directly. SQL driver handles nil automatically.
 	result, err := tx.Exec(productQuery,
 		product.SupplierID, product.Name, product.Description,
 		product.PriceToTTS, product.StockQuantity, product.SKU,
 		product.IsVariable, product.Status, product.CreatedAt, product.UpdatedAt,
-		weight, pkgLength, pkgWidth, pkgHeight, product.CommissionRate,
+		product.Weight, pkgLength, pkgWidth, pkgHeight, product.CommissionRate,
 		categoryLegacy, brandNameLegacy, srp, weightGrams,
-		string(imagesJSON), videoURL, string(sizeChartJSON), string(variationImagesJSON),
+		string(imagesJSON), input.VideoURL, string(sizeChartJSON), string(variationImagesJSON),
 	)
 	if err != nil {
 		fmt.Printf("DB Error: %v\n", err)
@@ -254,12 +251,13 @@ func (h *Handlers) CreateProduct(c *gin.Context) {
 		varQ := `INSERT INTO product_variants (product_id, sku, price_to_tts, stock_quantity, options, commission_rate, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 		for _, v := range input.Variants {
 			optJSON, _ := json.Marshal(v.Options)
-			var vComm sql.NullFloat64
-			if v.CommissionRate != nil {
-				vComm = sql.NullFloat64{Float64: *v.CommissionRate, Valid: true}
+			var vSku *string
+			if v.SKU != "" {
+				s := v.SKU
+				vSku = &s
 			}
-			sku := sql.NullString{String: v.SKU, Valid: v.SKU != ""}
-			tx.Exec(varQ, productID, sku, v.Price, v.Stock, string(optJSON), vComm, time.Now(), time.Now())
+			// Pass pointers directly
+			tx.Exec(varQ, productID, vSku, v.Price, v.Stock, string(optJSON), v.CommissionRate, time.Now(), time.Now())
 		}
 	}
 
