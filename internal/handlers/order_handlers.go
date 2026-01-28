@@ -304,3 +304,128 @@ func (h *Handlers) GetOrderDetails(c *gin.Context) {
 		"items": items,
 	})
 }
+
+// internal/handlers/order_handlers.go
+
+// PayOrder handles the payment for an existing "on-hold" order.
+// Route: POST /v1/dropshipper/orders/:id/pay
+func (h *Handlers) PayOrder(c *gin.Context) {
+	// 1. Get IDs
+	userID_raw, _ := c.Get("userID")
+	dropshipperID := userID_raw.(int64)
+	orderID := c.Param("id")
+
+	// 2. Begin Transaction
+	tx, err := h.DB.Begin()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction"})
+		return
+	}
+	defer tx.Rollback()
+
+	// 3. Fetch Order Details (Locking the row to prevent double payment)
+	var totalAmount float64
+	var status string
+	queryOrder := "SELECT total, status FROM orders WHERE id = ? AND user_id = ? FOR UPDATE"
+	err = tx.QueryRow(queryOrder, orderID, dropshipperID).Scan(&totalAmount, &status)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Order not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch order"})
+		return
+	}
+
+	if status != "on-hold" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Order is not in 'on-hold' status"})
+		return
+	}
+
+	// 4. Check Wallet Balance
+	balance, err := h.GetWalletBalance(tx, dropshipperID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check wallet balance"})
+		return
+	}
+
+	if balance < totalAmount {
+		c.JSON(http.StatusPaymentRequired, gin.H{"error": "Insufficient wallet balance"})
+		return
+	}
+
+	// 5. Fetch Order Items to Check & Deduct Stock
+	// (Since stock wasn't deducted when the order was placed as 'on-hold', we must do it now)
+	type ItemStockCheck struct {
+		ProductID int64
+		Quantity  int
+		Stock     int
+	}
+	queryItems := `
+		SELECT oi.product_id, oi.quantity, p.stock_quantity
+		FROM order_items oi
+		JOIN products p ON oi.product_id = p.id
+		WHERE oi.order_id = ?
+	`
+	rows, err := tx.Query(queryItems, orderID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch order items"})
+		return
+	}
+	defer rows.Close()
+
+	var itemsToCheck []ItemStockCheck
+	for rows.Next() {
+		var item ItemStockCheck
+		if err := rows.Scan(&item.ProductID, &item.Quantity, &item.Stock); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to scan item"})
+			return
+		}
+		itemsToCheck = append(itemsToCheck, item)
+	}
+
+	// Check if items are still in stock
+	for _, item := range itemsToCheck {
+		if item.Stock < item.Quantity {
+			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Product ID %d is now out of stock", item.ProductID)})
+			return
+		}
+	}
+
+	// 6. Execute Updates
+
+	// A. Deduct Stock
+	updateStock := "UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ?"
+	for _, item := range itemsToCheck {
+		if _, err := tx.Exec(updateStock, item.Quantity, item.ProductID); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update stock"})
+			return
+		}
+	}
+
+	// B. Deduct Wallet
+	err = h.AddWalletTransaction(tx, dropshipperID, "order_payment", -totalAmount, fmt.Sprintf("Payment for Order #%s", orderID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process wallet deduction"})
+		return
+	}
+
+	// C. Update Order Status
+	_, err = tx.Exec("UPDATE orders SET status = 'processing', updated_at = ? WHERE id = ?", time.Now(), orderID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update order status"})
+		return
+	}
+
+	// 7. Commit
+	if err := tx.Commit(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":    "Payment successful",
+		"new_status": "processing",
+	})
+}

@@ -155,6 +155,7 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 			dropshipper.GET("/orders", h.GetMyOrders)
 			dropshipper.GET("/orders/:id", h.GetOrderDetails)
 			dropshipper.GET("/dashboard-stats", h.GetDropshipperStats)
+			dropshipper.POST("/orders/:id/pay", h.PayOrder)
 		}
 	}
 
