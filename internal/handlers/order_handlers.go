@@ -53,7 +53,7 @@ func (h *Handlers) Checkout(c *gin.Context) {
 		SELECT ci.product_id, ci.quantity, p.price_to_tts, p.stock_quantity
 		FROM cart_items ci
 		JOIN products p ON ci.product_id = p.id
-		WHERE ci.cart_id = ? AND p.status = 'published'
+		WHERE ci.cart_id = ? AND p.status = 'active'
 		FOR UPDATE
 	`
 
@@ -84,7 +84,7 @@ func (h *Handlers) Checkout(c *gin.Context) {
 	}
 
 	if len(cartItems) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Your cart contains no published products"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Your cart contains no active products"})
 		return
 	}
 

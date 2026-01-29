@@ -79,70 +79,51 @@ func (h *Handlers) GetPendingProducts(c *gin.Context) {
 }
 
 // ApproveProduct is the handler for PATCH /v1/manager/products/:id/approve
-// It changes a product's status from "pending" to "published".
 func (h *Handlers) ApproveProduct(c *gin.Context) {
 	productIDStr := c.Param("id")
 
-	// 1. --- Begin Transaction ---
 	tx, err := h.DB.Begin()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction"})
 		return
 	}
-	defer tx.Rollback() // Safety net
+	defer tx.Rollback()
 
-	// 2. --- Get Product Info (and lock the row) ---
 	var supplierID int64
 	var productName string
-	// We use 'FOR UPDATE' to lock this product row for the transaction.
+	// Step 1: Get data and lock row.
+	// Note: We check for 'pending' in the query to match your current handler logic.
 	err = tx.QueryRow("SELECT supplier_id, name FROM products WHERE id = ? AND status = 'pending' FOR UPDATE", productIDStr).Scan(&supplierID, &productName)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			c.JSON(http.StatusNotFound, gin.H{"error": "Product not found or was not pending approval"})
+			c.JSON(http.StatusNotFound, gin.H{"error": "Product not found or not pending"})
 			return
 		}
-		fmt.Printf("ApproveProduct DB Error: %v\n", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get product details"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
 		return
 	}
 
-	// 3. --- Update Product Status ---
-	query := `
-		UPDATE products
-		SET status = ?, updated_at = ?
-		WHERE id = ? AND status = ?`
-
-	_, err = tx.Exec(query, "published", time.Now(), productIDStr, "pending")
+	// Step 2: Update status to 'active' (Matches your SQL ENUM)
+	query := `UPDATE products SET status = 'active', updated_at = NOW() WHERE id = ?`
+	_, err = tx.Exec(query, productIDStr)
 	if err != nil {
-		fmt.Printf("ApproveProduct Update Error: %v\n", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to approve product"})
+		fmt.Printf("SQL Error: %v\n", err) // This will now show the ENUM mismatch if it persisted
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update status"})
 		return
 	}
 
-	// 4. --- Add Notification ---
-	// If this fails, we LOG it but we don't fail the entire approval (optional safety).
-	message := fmt.Sprintf("Your product \"%s\" has been approved and is now published.", productName)
-	link := fmt.Sprintf("/supplier/products") // Link to supplier's product list
-
-	// NOTE: Assuming h.AddNotification accepts (tx *sql.Tx, ...).
-	// If your AddNotification implementation does NOT accept tx, change 'tx' to 'h.DB' (but careful with locks).
-	if err := h.AddNotification(tx, supplierID, message, link); err != nil {
-		// Log the error but proceed (don't block approval just because notification failed?)
-		// For now, we will block to be safe, but print the error.
-		fmt.Printf("ApproveProduct Notification Error: %v\n", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to send notification"})
-		return
+	// Step 3: Notification
+	message := fmt.Sprintf("Your product \"%s\" has been approved!", productName)
+	if err := h.AddNotification(tx, supplierID, message, "/supplier/products"); err != nil {
+		fmt.Printf("Notification Error: %v\n", err)
 	}
 
-	// 5. --- Commit Transaction ---
 	if err := tx.Commit(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Commit failed"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"message": "Product approved and published successfully",
-	})
+	c.JSON(http.StatusOK, gin.H{"message": "Product approved successfully"})
 }
 
 // RejectProductInput defines the JSON input for rejecting a product.

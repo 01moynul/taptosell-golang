@@ -435,10 +435,10 @@ func (h *Handlers) UpdateProduct(c *gin.Context) {
 	defer tx.Rollback()
 
 	// 4.5 --- Price Change Validation ---
-	if currentProduct.Status == "published" && !currentProduct.IsVariable && input.SimpleProduct != nil {
+	if currentProduct.Status == "active" && !currentProduct.IsVariable && input.SimpleProduct != nil {
 		if input.SimpleProduct.Price != currentProduct.PriceToTTS {
 			c.JSON(http.StatusForbidden, gin.H{
-				"error": "You cannot change the price of a 'published' product. Please use the 'Request Price Change' feature.",
+				"error": "You cannot change the price of a 'active' product. Please use the 'Request Price Change' feature.",
 			})
 			return
 		}
@@ -574,10 +574,11 @@ func (h *Handlers) SearchProducts(c *gin.Context) {
 	var queryBuilder strings.Builder
 	var args []interface{}
 
+	// 1. --- Select Fields (Added srp to match model) ---
 	queryBuilder.WriteString(`
 		SELECT DISTINCT
 			p.id, p.supplier_id, p.sku, p.name, p.description,
-			p.price_to_tts, p.stock_quantity, p.is_variable, p.status,
+			p.price_to_tts, p.stock_quantity, p.srp, p.is_variable, p.status,
 			p.created_at, p.updated_at,
 			p.weight, p.pkg_length, p.pkg_width, p.pkg_height, p.commission_rate
 		FROM products p
@@ -590,8 +591,9 @@ func (h *Handlers) SearchProducts(c *gin.Context) {
 		queryBuilder.WriteString(" JOIN product_brands pb ON p.id = pb.product_id")
 	}
 
+	// 2. --- Filter by 'active' (Alignment Fix) ---
 	queryBuilder.WriteString(" WHERE p.status = ?")
-	args = append(args, "published")
+	args = append(args, "active") // Changed from 'active' to 'active'
 
 	if categoryID != "" {
 		queryBuilder.WriteString(" AND pc.category_id = ?")
@@ -625,6 +627,7 @@ func (h *Handlers) SearchProducts(c *gin.Context) {
 	}
 	defer rows.Close()
 
+	// 3. --- Scan Rows (Aligned with SELECT and Model) ---
 	var products []*models.Product
 	for rows.Next() {
 		var product models.Product
@@ -636,6 +639,7 @@ func (h *Handlers) SearchProducts(c *gin.Context) {
 			&product.Description,
 			&product.PriceToTTS,
 			&product.StockQuantity,
+			&product.SRP, // Included srp
 			&product.IsVariable,
 			&product.Status,
 			&product.CreatedAt,
@@ -646,14 +650,11 @@ func (h *Handlers) SearchProducts(c *gin.Context) {
 			&product.PkgHeight,
 			&product.CommissionRate,
 		); err != nil {
+			fmt.Printf("Scan Error: %v\n", err) // Log exact scan error
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to scan product row"})
 			return
 		}
 		products = append(products, &product)
-	}
-	if err = rows.Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error iterating product rows"})
-		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -710,8 +711,8 @@ func (h *Handlers) RequestPriceChange(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "You do not have permission to modify this product"})
 		return
 	}
-	if currentProduct.Status != "published" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Price appeals can only be made for 'published' products. Please edit your 'draft' product directly."})
+	if currentProduct.Status != "active" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Price appeals can only be made for 'active' products. Please edit your 'draft' product directly."})
 		return
 	}
 

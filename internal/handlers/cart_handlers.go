@@ -45,118 +45,73 @@ func (h *Handlers) getOrCreateCartID(tx *sql.Tx, userID int64) (int64, error) {
 }
 
 // AddToCartInput defines the JSON for adding an item to the cart.
+// AddToCartInput defines the JSON for adding an item to the cart.
+// FIX: Updated tags to match the snake_case sent by cartService.ts
 type AddToCartInput struct {
-	ProductID int64 `json:"productId" binding:"required"`
-	Quantity  int   `json:"quantity" binding:"required,gt=0"` // Must add at least 1
+	ProductID int64 `json:"product_id" binding:"required"`
+	Quantity  int   `json:"quantity" binding:"required,gt=0"`
 }
 
-// AddToCart is the handler for POST /v1/dropshipper/cart/items
-// It adds a new item or updates the quantity of an existing item.
 func (h *Handlers) AddToCart(c *gin.Context) {
-	// 1. --- Get Dropshipper ID ---
 	userID_raw, _ := c.Get("userID")
 	dropshipperID := userID_raw.(int64)
 
-	// 2. --- Bind & Validate JSON ---
 	var input AddToCartInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input: " + err.Error()})
 		return
 	}
 
-	// 3. --- Begin Transaction ---
 	tx, err := h.DB.Begin()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Transaction failed"})
 		return
 	}
-	defer tx.Rollback() // Safety net
+	defer tx.Rollback()
 
-	// 4. --- Get or Create Cart ---
 	cartID, err := h.getOrCreateCartID(tx, dropshipperID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get or create cart"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Cart initialization failed"})
 		return
 	}
 
-	// 5. --- Check if item is already in cart ---
-	var existingQuantity int
-	checkQuery := "SELECT quantity FROM cart_items WHERE cart_id = ? AND product_id = ?"
-	err = tx.QueryRow(checkQuery, cartID, input.ProductID).Scan(&existingQuantity)
-
-	now := time.Now()
-	if err == sql.ErrNoRows {
-		// Case 1: New Item. Insert it.
-		// First, check if the product is 'published' and has stock
-		// UPDATED: Select stock_quantity
-		var stock int
-		err := tx.QueryRow("SELECT stock_quantity FROM products WHERE id = ? AND status = 'published'", input.ProductID).Scan(&stock)
-		if err != nil {
-			if err == sql.ErrNoRows {
-				c.JSON(http.StatusNotFound, gin.H{"error": "Product not found or is not published"})
-				return
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check product stock"})
+	// Logic check: Ensure the product is 'active' (our new ENUM value)
+	var stock int
+	err = tx.QueryRow("SELECT stock_quantity FROM products WHERE id = ? AND status = 'active'", input.ProductID).Scan(&stock)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Product not found or not active"})
 			return
 		}
-		if stock < input.Quantity {
-			c.JSON(http.StatusConflict, gin.H{"error": "Not enough stock available"})
-			return
-		}
-
-		// Insert new cart item
-		insertQuery := `
-			INSERT INTO cart_items
-			(cart_id, product_id, quantity, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?)`
-		_, err = tx.Exec(insertQuery, cartID, input.ProductID, input.Quantity, now, now)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to add item to cart"})
-			return
-		}
-	} else if err == nil {
-		// Case 2: Existing Item. Update its quantity.
-		newQuantity := existingQuantity + input.Quantity
-
-		// Check stock for the *new* total quantity
-		// UPDATED: Select stock_quantity
-		var stock int
-		err := tx.QueryRow("SELECT stock_quantity FROM products WHERE id = ? AND status = 'published'", input.ProductID).Scan(&stock)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check product stock"})
-			return
-		}
-		if stock < newQuantity {
-			c.JSON(http.StatusConflict, gin.H{"error": "Not enough stock to add more items"})
-			return
-		}
-
-		// Update existing cart item
-		updateQuery := `
-			UPDATE cart_items
-			SET quantity = ?, updated_at = ?
-			WHERE cart_id = ? AND product_id = ?`
-		_, err = tx.Exec(updateQuery, newQuantity, now, cartID, input.ProductID)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update item in cart"})
-			return
-		}
-	} else {
-		// Case 3: A real database error occurred
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check cart items"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
 		return
 	}
 
-	// 6. --- Commit Transaction ---
+	if stock < input.Quantity {
+		c.JSON(http.StatusConflict, gin.H{"error": "Insufficient stock"})
+		return
+	}
+
+	// Insert or Update logic (Upsert)
+	_, err = tx.Exec(`
+		INSERT INTO cart_items (cart_id, product_id, quantity, updated_at)
+		VALUES (?, ?, ?, NOW())
+		ON DUPLICATE KEY UPDATE 
+			quantity = quantity + VALUES(quantity),
+			updated_at = NOW()`,
+		cartID, input.ProductID, input.Quantity)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update cart"})
+		return
+	}
+
 	if err := tx.Commit(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Commit failed"})
 		return
 	}
 
-	// 7. --- Send Success Response ---
-	c.JSON(http.StatusCreated, gin.H{
-		"message": "Item added to cart",
-	})
+	c.JSON(http.StatusCreated, gin.H{"message": "Item added to cart"})
 }
 
 // CartItemResponse is a helper struct for the GetCart handler
@@ -202,7 +157,7 @@ func (h *Handlers) GetCart(c *gin.Context) {
 			ci.product_id, p.name, p.sku, p.price_to_tts, ci.quantity, p.stock_quantity
 		FROM cart_items ci
 		JOIN products p ON ci.product_id = p.id
-		WHERE ci.cart_id = ? AND p.status = 'published'
+		WHERE ci.cart_id = ? AND p.status = 'active'
 	`
 	rows, err := h.DB.Query(query, cartID)
 	if err != nil {
@@ -295,7 +250,7 @@ func (h *Handlers) UpdateCartItem(c *gin.Context) {
 	// 4. --- Check Stock ---
 	// UPDATED: Select stock_quantity
 	var stock int
-	err = h.DB.QueryRow("SELECT stock_quantity FROM products WHERE id = ? AND status = 'published'", productIDStr).Scan(&stock)
+	err = h.DB.QueryRow("SELECT stock_quantity FROM products WHERE id = ? AND status = 'active'", productIDStr).Scan(&stock)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Product not found"})

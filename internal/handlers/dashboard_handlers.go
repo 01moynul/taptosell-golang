@@ -121,7 +121,7 @@ func (h *Handlers) GetSupplierStats(c *gin.Context) {
 	}
 
 	// 5. Marketplace Product Counts
-	err = h.DB.QueryRow("SELECT COUNT(*) FROM products WHERE supplier_id = ? AND status = 'published'", supplierID).Scan(&stats.LiveProducts)
+	err = h.DB.QueryRow("SELECT COUNT(*) FROM products WHERE supplier_id = ? AND status = 'active'", supplierID).Scan(&stats.LiveProducts)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to count live products"})
 		return
