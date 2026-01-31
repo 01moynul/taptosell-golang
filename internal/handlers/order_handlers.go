@@ -429,3 +429,82 @@ func (h *Handlers) PayOrder(c *gin.Context) {
 		"new_status": "processing",
 	})
 }
+
+// GetSupplierSales handles GET /v1/supplier/orders
+// Returns orders that contain the supplier's products.
+func (h *Handlers) GetSupplierSales(c *gin.Context) {
+	userID_raw, _ := c.Get("userID")
+	supplierID := userID_raw.(int64)
+
+	// This query finds unique orders that contain items belonging to this supplier
+	query := `
+		SELECT DISTINCT o.id, o.status, o.total, o.created_at, o.tracking
+		FROM orders o
+		JOIN order_items oi ON o.id = oi.order_id
+		JOIN products p ON oi.product_id = p.id
+		WHERE p.supplier_id = ?
+		ORDER BY o.created_at DESC
+	`
+
+	rows, err := h.DB.Query(query, supplierID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch sales history"})
+		return
+	}
+	defer rows.Close()
+
+	var orders []models.Order
+	for rows.Next() {
+		var o models.Order
+		var tracking sql.NullString
+		if err := rows.Scan(&o.ID, &o.Status, &o.Total, &o.CreatedAt, &tracking); err != nil {
+			continue
+		}
+		o.Tracking = tracking
+		orders = append(orders, o)
+	}
+
+	if orders == nil {
+		orders = []models.Order{}
+	}
+	c.JSON(http.StatusOK, gin.H{"orders": orders})
+}
+
+// UpdateOrderTracking handles PATCH /v1/supplier/orders/:id/ship
+func (h *Handlers) UpdateOrderTracking(c *gin.Context) {
+	userID_raw, _ := c.Get("userID")
+	supplierID := userID_raw.(int64)
+	orderID := c.Param("id")
+
+	var input struct {
+		Tracking string `json:"tracking" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Tracking number is required"})
+		return
+	}
+
+	// Verify ownership: Does this order contain items from this supplier?
+	var exists int
+	checkQuery := `
+        SELECT 1 FROM order_items oi 
+        JOIN products p ON oi.product_id = p.id 
+        WHERE oi.order_id = ? AND p.supplier_id = ? LIMIT 1`
+
+	err := h.DB.QueryRow(checkQuery, orderID, supplierID).Scan(&exists)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You cannot fulfill an order that doesn't belong to you"})
+		return
+	}
+
+	// Update Order status and tracking
+	updateQuery := "UPDATE orders SET status = 'shipped', tracking = ?, updated_at = ? WHERE id = ?"
+	_, err = h.DB.Exec(updateQuery, input.Tracking, time.Now(), orderID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update shipment status"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Order marked as shipped", "status": "shipped"})
+}

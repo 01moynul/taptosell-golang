@@ -84,6 +84,10 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 			auth.POST("/supplier/wallet/request-withdrawal", h.RequestWithdrawal)
 			auth.POST("/products/:id/request-price-change", h.RequestPriceChange)
 
+			// [NEW] Supplier Order Fulfillment
+			// This route allows suppliers to fulfill orders containing their items
+			auth.PATCH("/supplier/orders/:id/ship", h.UpdateOrderTracking)
+
 			// Supplier Inventory
 			supplierInventory := auth.Group("/supplier/inventory")
 			{
@@ -98,6 +102,7 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 				supplierInventory.GET("/brands", h.GetMyInventoryBrands)
 			}
 			auth.GET("/supplier/dashboard-stats", h.GetSupplierStats)
+			auth.GET("/supplier/orders", h.GetSupplierSales)
 		}
 
 		// --- Manager-Only Routes ---
@@ -151,6 +156,7 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 			dropshipper.PUT("/cart/items/:product_id", h.UpdateCartItem)
 			dropshipper.DELETE("/cart/items/:product_id", h.DeleteCartItem)
 			dropshipper.GET("/wallet", h.GetMyWallet)
+			dropshipper.POST("/wallet/topup", h.ManualTopUp)
 			dropshipper.POST("/checkout", h.Checkout)
 			dropshipper.GET("/orders", h.GetMyOrders)
 			dropshipper.GET("/orders/:id", h.GetOrderDetails)

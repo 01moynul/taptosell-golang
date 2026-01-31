@@ -49,19 +49,24 @@ func (h *Handlers) GetWalletBalance(q Querier, userID int64) (float64, error) {
 // AddWalletTransaction creates a new transaction record.
 // This is the *only* function that should be used to modify a balance.
 // It MUST be called from within a transaction (tx).
-func (h *Handlers) AddWalletTransaction(tx *sql.Tx, userID int64, txType string, amount float64, details string) error {
-
-	// Add a safeguard: order transactions must be negative
-	if txType == "order" && amount > 0 {
-		amount = -amount
+// AddWalletTransaction creates a new transaction record.
+func (h *Handlers) AddWalletTransaction(tx *sql.Tx, userID int64, txType string, amount float64, notes string) error {
+	// 1. Get current balance to calculate balance_after
+	var currentBalance sql.NullFloat64
+	err := tx.QueryRow("SELECT SUM(amount) FROM wallet_transactions WHERE user_id = ? FOR UPDATE", userID).Scan(&currentBalance)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("failed to get balance for update: %w", err)
 	}
 
+	newBalance := currentBalance.Float64 + amount
+
+	// 2. Insert using correct column 'notes' and include 'status' and 'balance_after'
 	query := `
 		INSERT INTO wallet_transactions
-		(user_id, type, amount, details, created_at)
-		VALUES (?, ?, ?, ?, ?)`
+		(user_id, type, status, amount, balance_after, notes, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`
 
-	_, err := tx.Exec(query, userID, txType, amount, details, time.Now())
+	_, err = tx.Exec(query, userID, txType, "completed", amount, newBalance, notes, time.Now())
 	if err != nil {
 		return fmt.Errorf("failed to add wallet transaction: %w", err)
 	}
@@ -96,4 +101,41 @@ func (h *Handlers) GetMyWallet(c *gin.Context) {
 		"currentBalance": balance,
 		"transactions":   []models.WalletTransaction{}, // Placeholder
 	})
+}
+
+// ManualTopUp handles a simulated deposit for testing/manual adjustments.
+// Route: POST /v1/dropshipper/wallet/topup
+func (h *Handlers) ManualTopUp(c *gin.Context) {
+	userID_raw, _ := c.Get("userID")
+	userID := userID_raw.(int64)
+
+	var input struct {
+		Amount float64 `json:"amount" binding:"required,gt=0"`
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid amount"})
+		return
+	}
+
+	tx, err := h.DB.Begin()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction"})
+		return
+	}
+	defer tx.Rollback()
+
+	// Add credit transaction (positive amount)
+	err = h.AddWalletTransaction(tx, userID, "topup", input.Amount, "Manual test top-up")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to record transaction"})
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit top-up"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Top-up successful", "amount": input.Amount})
 }
