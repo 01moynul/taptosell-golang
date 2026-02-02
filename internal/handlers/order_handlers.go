@@ -508,3 +508,69 @@ func (h *Handlers) UpdateOrderTracking(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"message": "Order marked as shipped", "status": "shipped"})
 }
+
+// CompleteOrder handles the final step where a dropshipper confirms receipt.
+// This triggers the release of funds to the supplier's available balance.
+// Route: POST /v1/dropshipper/orders/:id/complete
+func (h *Handlers) CompleteOrder(c *gin.Context) {
+	userID_raw, _ := c.Get("userID")
+	dropshipperID := userID_raw.(int64)
+	orderID := c.Param("id")
+
+	tx, err := h.DB.Begin()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction"})
+		return
+	}
+	defer tx.Rollback()
+
+	var status string
+	var totalAmount float64
+	var supplierID int64
+
+	// Refined query to ensure we get the supplier correctly
+	checkQuery := `
+		SELECT o.status, o.total, p.supplier_id
+		FROM orders o
+		JOIN order_items oi ON o.id = oi.order_id
+		JOIN products p ON oi.product_id = p.id
+		WHERE o.id = ? AND o.user_id = ?
+		LIMIT 1
+	`
+	err = tx.QueryRow(checkQuery, orderID, dropshipperID).Scan(&status, &totalAmount, &supplierID)
+	if err != nil {
+		fmt.Printf("Error finding supplier for Order %s: %v\n", orderID, err) // DEBUG LOG
+		c.JSON(http.StatusNotFound, gin.H{"error": "Order verification failed"})
+		return
+	}
+
+	if status != "shipped" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Only shipped orders can be completed"})
+		return
+	}
+
+	// 1. Update Order Status
+	_, err = tx.Exec("UPDATE orders SET status = 'completed', updated_at = ? WHERE id = ?", time.Now(), orderID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update order status"})
+		return
+	}
+
+	// 2. RELEASE FUNDS: Add transaction to Supplier Wallet
+	notes := fmt.Sprintf("Payout for completed Order #%s", orderID)
+	fmt.Printf("Processing Payout: Supplier %d, Amount %.2f\n", supplierID, totalAmount) // DEBUG LOG
+
+	err = h.AddWalletTransaction(tx, supplierID, "payout", totalAmount, notes)
+	if err != nil {
+		fmt.Printf("Payout Transaction Failed: %v\n", err) // DEBUG LOG
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Fund release failed"})
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Commit failed"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Funds released", "status": "completed"})
+}

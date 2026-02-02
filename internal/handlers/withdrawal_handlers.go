@@ -143,7 +143,7 @@ func (h *Handlers) RequestWithdrawal(c *gin.Context) {
 	// As per our WP audit, this deducts the funds from the "available"
 	// balance immediately, holding them in "pending" status.
 	details := fmt.Sprintf("Pending withdrawal (Request ID: %d)", requestID)
-	err = h.AddWalletTransaction(tx, supplierID, "withdrawal_request", -input.Amount, details)
+	err = h.AddWalletTransaction(tx, supplierID, "withdrawal", -input.Amount, details)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to add wallet transaction"})
 		return
