@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"time"
@@ -17,9 +18,10 @@ import (
 // CartItemData is a helper struct for fetching cart items during checkout
 type CartItemData struct {
 	ProductID int64
+	VariantID *int64 // [NEW] Track the specific variant
 	Quantity  int
-	Price     float64 // The *current* price from the products table
-	Stock     int
+	Price     float64 // Correct price (Variant or Base)
+	Stock     int     // Correct stock (Variant or Base)
 }
 
 // Checkout is the handler for POST /v1/dropshipper/checkout
@@ -36,7 +38,7 @@ func (h *Handlers) Checkout(c *gin.Context) {
 	}
 	defer tx.Rollback() // Safety net
 
-	// 3. --- Get User's Cart & Items ---
+	// 3. --- Get User's Cart ---
 	var cartID int64
 	err = tx.QueryRow("SELECT id FROM carts WHERE user_id = ?", dropshipperID).Scan(&cartID)
 	if err != nil {
@@ -48,11 +50,17 @@ func (h *Handlers) Checkout(c *gin.Context) {
 		return
 	}
 
-	// Get all items in the cart AND *lock* the product rows for this transaction
+	// [FIX] Phase 8.4: Fetch correct Price/Stock using JOINs on Variants
 	query := `
-		SELECT ci.product_id, ci.quantity, p.price_to_tts, p.stock_quantity
+		SELECT 
+			ci.product_id, 
+			ci.variant_id, 
+			ci.quantity, 
+			COALESCE(v.price_to_tts, p.price_to_tts) as final_price, 
+			COALESCE(v.stock_quantity, p.stock_quantity) as available_stock
 		FROM cart_items ci
 		JOIN products p ON ci.product_id = p.id
+		LEFT JOIN product_variants v ON ci.variant_id = v.id
 		WHERE ci.cart_id = ? AND p.status = 'active'
 		FOR UPDATE
 	`
@@ -69,14 +77,15 @@ func (h *Handlers) Checkout(c *gin.Context) {
 
 	for rows.Next() {
 		var item CartItemData
-		if err := rows.Scan(&item.ProductID, &item.Quantity, &item.Price, &item.Stock); err != nil {
+		// Scan the variant_id (which might be nil)
+		if err := rows.Scan(&item.ProductID, &item.VariantID, &item.Quantity, &item.Price, &item.Stock); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to scan cart item"})
 			return
 		}
 
 		// 4. --- Check Stock & Calculate Total ---
 		if item.Stock < item.Quantity {
-			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Not enough stock for product ID %d", item.ProductID)})
+			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Not enough stock for Product ID %d", item.ProductID)})
 			return
 		}
 		totalOrderCost += item.Price * float64(item.Quantity)
@@ -102,6 +111,8 @@ func (h *Handlers) Checkout(c *gin.Context) {
 	var orderStatus string
 
 	if walletBalance < totalOrderCost {
+		// [Logic Check] If you want to BLOCK checkout on low balance, return Error here.
+		// Currently, we allow "on-hold" orders.
 		orderStatus = "on-hold"
 	} else {
 		orderStatus = "processing"
@@ -122,24 +133,30 @@ func (h *Handlers) Checkout(c *gin.Context) {
 		return
 	}
 
-	// 7. --- Create Order Items & Update Wallet/Stock ---
+	// 7. --- Create Order Items & Update Stock ---
+	// [FIX] Insert variant_id into order_items
 	itemQuery := `
-		INSERT INTO order_items (order_id, product_id, quantity, unit_price, created_at)
-		VALUES (?, ?, ?, ?, ?)`
-
-	stockQuery := "UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ?"
+		INSERT INTO order_items (order_id, product_id, variant_id, quantity, unit_price, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)`
 
 	for _, item := range cartItems {
-		// a. Snapshot the item into order_items
-		_, err := tx.Exec(itemQuery, orderID, item.ProductID, item.Quantity, item.Price, now)
+		// a. Save Item
+		_, err := tx.Exec(itemQuery, orderID, item.ProductID, item.VariantID, item.Quantity, item.Price, now)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save order item"})
 			return
 		}
 
-		// b. If the order is paid, deduct stock
+		// b. If paid, Deduct Stock
 		if orderStatus == "processing" {
-			_, err := tx.Exec(stockQuery, item.Quantity, item.ProductID)
+			if item.VariantID != nil && *item.VariantID > 0 {
+				// Deduct from VARIANT table
+				_, err = tx.Exec("UPDATE product_variants SET stock_quantity = stock_quantity - ? WHERE id = ?", item.Quantity, *item.VariantID)
+			} else {
+				// Deduct from PRODUCT table
+				_, err = tx.Exec("UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ?", item.Quantity, item.ProductID)
+			}
+
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to deduct stock"})
 				return
@@ -147,9 +164,9 @@ func (h *Handlers) Checkout(c *gin.Context) {
 		}
 	}
 
-	// c. If the order is paid, deduct from wallet
+	// c. If paid, Deduct Wallet
 	if orderStatus == "processing" {
-		err = h.AddWalletTransaction(tx, dropshipperID, "order", -totalOrderCost, fmt.Sprintf("Payment for Order ID %d", orderID))
+		err = h.AddWalletTransaction(tx, dropshipperID, "order_payment", -totalOrderCost, fmt.Sprintf("Payment for Order ID %d", orderID))
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to deduct from wallet"})
 			return
@@ -185,8 +202,9 @@ func (h *Handlers) Checkout(c *gin.Context) {
 // OrderItemDetail extends the base OrderItem to include Product info
 type OrderItemDetail struct {
 	models.OrderItem
-	ProductName string `json:"productName"`
-	ProductSKU  string `json:"productSku"`
+	ProductName string              `json:"productName"`
+	ProductSKU  string              `json:"productSku"`
+	Options     []map[string]string `json:"options"` // [NEW] To display "Color: Red"
 }
 
 // GetMyOrders is the handler for GET /v1/dropshipper/orders
@@ -234,6 +252,7 @@ func (h *Handlers) GetMyOrders(c *gin.Context) {
 	})
 }
 
+// [FIXED] OrderItemDetail now includes Options
 // GetOrderDetails is the handler for GET /v1/dropshipper/orders/:id
 func (h *Handlers) GetOrderDetails(c *gin.Context) {
 	// 1. --- Get IDs ---
@@ -264,13 +283,17 @@ func (h *Handlers) GetOrderDetails(c *gin.Context) {
 	}
 	o.Tracking = tracking
 
-	// 3. --- Fetch Order Items with Product Details ---
+	// 3. --- Fetch Order Items with Variant Details ---
+	// [FIX] Phase 8.6: Join product_variants to get specific SKU and Options
 	queryItems := `
 		SELECT 
 			oi.id, oi.order_id, oi.product_id, oi.quantity, oi.unit_price, oi.created_at,
-			p.name, p.sku
+			p.name, 
+			COALESCE(v.sku, p.sku) as display_sku,
+			v.options
 		FROM order_items oi
 		JOIN products p ON oi.product_id = p.id
+		LEFT JOIN product_variants v ON oi.variant_id = v.id
 		WHERE oi.order_id = ?
 	`
 
@@ -284,13 +307,24 @@ func (h *Handlers) GetOrderDetails(c *gin.Context) {
 	var items []OrderItemDetail
 	for rows.Next() {
 		var item OrderItemDetail
+		var optionsJSON []byte // Buffer for JSON
+
+		// Scan row
 		if err := rows.Scan(
 			&item.ID, &item.OrderID, &item.ProductID, &item.Quantity, &item.UnitPrice, &item.CreatedAt,
-			&item.ProductName, &item.ProductSKU,
+			&item.ProductName, &item.ProductSKU, &optionsJSON,
 		); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to scan order item"})
 			return
 		}
+
+		// [FIX] Parse Options JSON
+		if len(optionsJSON) > 0 {
+			_ = json.Unmarshal(optionsJSON, &item.Options)
+		} else {
+			item.Options = []map[string]string{}
+		}
+
 		items = append(items, item)
 	}
 
@@ -573,4 +607,66 @@ func (h *Handlers) CompleteOrder(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Funds released", "status": "completed"})
+}
+
+// SupplierOrderItem represents a single line item for the supplier to pack
+type SupplierOrderItem struct {
+	ProductName string              `json:"productName"`
+	SKU         string              `json:"sku"`
+	Quantity    int                 `json:"quantity"`
+	UnitPrice   float64             `json:"unitPrice"`
+	Options     []map[string]string `json:"options"` // To show "Color: Red"
+}
+
+// GetSupplierOrderDetails handles GET /v1/supplier/orders/:id
+func (h *Handlers) GetSupplierOrderDetails(c *gin.Context) {
+	userID_raw, _ := c.Get("userID")
+	supplierID := userID_raw.(int64)
+	orderID := c.Param("id")
+
+	// 1. Fetch Items specific to this Supplier
+	// We join product_variants to get the specific SKU and Options
+	query := `
+		SELECT 
+			p.name, 
+			COALESCE(v.sku, p.sku) as sku,
+			oi.quantity, 
+			oi.unit_price,
+			v.options
+		FROM order_items oi
+		JOIN products p ON oi.product_id = p.id
+		LEFT JOIN product_variants v ON oi.variant_id = v.id
+		WHERE oi.order_id = ? AND p.supplier_id = ?
+	`
+
+	rows, err := h.DB.Query(query, orderID, supplierID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch order items"})
+		return
+	}
+	defer rows.Close()
+
+	var items []SupplierOrderItem
+	for rows.Next() {
+		var item SupplierOrderItem
+		var optionsJSON []byte
+
+		err := rows.Scan(&item.ProductName, &item.SKU, &item.Quantity, &item.UnitPrice, &optionsJSON)
+		if err != nil {
+			continue
+		}
+
+		// Parse options (e.g. [{"name":"Color","value":"Red"}])
+		if len(optionsJSON) > 0 {
+			_ = json.Unmarshal(optionsJSON, &item.Options)
+		} else {
+			item.Options = []map[string]string{}
+		}
+
+		items = append(items, item)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"items": items,
+	})
 }

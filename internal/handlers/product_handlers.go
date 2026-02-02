@@ -564,6 +564,7 @@ func (h *Handlers) DeleteProduct(c *gin.Context) {
 	})
 }
 
+// [FIXED] SearchProducts with Images and Variants
 func (h *Handlers) SearchProducts(c *gin.Context) {
 	q := c.Query("q")
 	categoryID := c.Query("category")
@@ -574,15 +575,16 @@ func (h *Handlers) SearchProducts(c *gin.Context) {
 	var queryBuilder strings.Builder
 	var args []interface{}
 
-	// 1. --- Select Fields (Added srp to match model) ---
+	// 1. SELECT - Added p.images and p.variation_images
 	queryBuilder.WriteString(`
-		SELECT DISTINCT
-			p.id, p.supplier_id, p.sku, p.name, p.description,
-			p.price_to_tts, p.stock_quantity, p.srp, p.is_variable, p.status,
-			p.created_at, p.updated_at,
-			p.weight, p.pkg_length, p.pkg_width, p.pkg_height, p.commission_rate
-		FROM products p
-	`)
+        SELECT DISTINCT
+            p.id, p.supplier_id, p.sku, p.name, p.description,
+            p.price_to_tts, p.stock_quantity, p.srp, p.is_variable, p.status,
+            p.created_at, p.updated_at,
+            p.weight, p.pkg_length, p.pkg_width, p.pkg_height, p.commission_rate,
+            p.images, p.variation_images
+        FROM products p
+    `)
 
 	if categoryID != "" {
 		queryBuilder.WriteString(" JOIN product_categories pc ON p.id = pc.product_id")
@@ -591,9 +593,9 @@ func (h *Handlers) SearchProducts(c *gin.Context) {
 		queryBuilder.WriteString(" JOIN product_brands pb ON p.id = pb.product_id")
 	}
 
-	// 2. --- Filter by 'active' (Alignment Fix) ---
+	// 2. Filter by 'active'
 	queryBuilder.WriteString(" WHERE p.status = ?")
-	args = append(args, "active") // Changed from 'active' to 'active'
+	args = append(args, "active")
 
 	if categoryID != "" {
 		queryBuilder.WriteString(" AND pc.category_id = ?")
@@ -627,10 +629,13 @@ func (h *Handlers) SearchProducts(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	// 3. --- Scan Rows (Aligned with SELECT and Model) ---
 	var products []*models.Product
+
+	// 3. Scan Rows
 	for rows.Next() {
 		var product models.Product
+		var dbImages, dbVariationImages []byte // Buffers for JSON columns
+
 		if err := rows.Scan(
 			&product.ID,
 			&product.SupplierID,
@@ -639,7 +644,7 @@ func (h *Handlers) SearchProducts(c *gin.Context) {
 			&product.Description,
 			&product.PriceToTTS,
 			&product.StockQuantity,
-			&product.SRP, // Included srp
+			&product.SRP,
 			&product.IsVariable,
 			&product.Status,
 			&product.CreatedAt,
@@ -649,11 +654,56 @@ func (h *Handlers) SearchProducts(c *gin.Context) {
 			&product.PkgWidth,
 			&product.PkgHeight,
 			&product.CommissionRate,
+			&dbImages,          // Scan Images
+			&dbVariationImages, // Scan Variation Images
 		); err != nil {
-			fmt.Printf("Scan Error: %v\n", err) // Log exact scan error
+			fmt.Printf("Scan Error: %v\n", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to scan product row"})
 			return
 		}
+
+		// 4. Parse JSON Columns (Ensure they aren't nil/empty)
+		if len(dbImages) > 0 {
+			_ = json.Unmarshal(dbImages, &product.Images)
+		} else {
+			product.Images = []string{}
+		}
+
+		// 5. Fetch Variants if Variable
+		if product.IsVariable {
+			vRows, err := h.DB.Query(`
+				SELECT id, sku, price_to_tts, stock_quantity, options 
+				FROM product_variants 
+				WHERE product_id = ?`, product.ID)
+
+			if err == nil {
+				var variants []models.ProductVariant
+				for vRows.Next() {
+					var v models.ProductVariant
+					var optsJSON []byte
+
+					// Scan database columns
+					err := vRows.Scan(&v.ID, &v.SKU, &v.PriceToTTS, &v.StockQuantity, &optsJSON)
+					if err != nil {
+						fmt.Printf("Variant Scan Error: %v\n", err)
+						continue
+					}
+
+					// [FIX] Phase 8.4: Handle JSON delivery to string field
+					// Convert DB bytes to string. If empty/null, provide valid JSON array string "[]"
+					if len(optsJSON) > 0 && string(optsJSON) != "null" && string(optsJSON) != `""` {
+						v.Options = string(optsJSON)
+					} else {
+						v.Options = "[]"
+					}
+
+					variants = append(variants, v)
+				}
+				vRows.Close()
+				product.Variants = variants
+			}
+		}
+
 		products = append(products, &product)
 	}
 

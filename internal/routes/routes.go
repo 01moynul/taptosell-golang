@@ -103,6 +103,7 @@ func SetupRouter(h *handlers.Handlers) *gin.Engine {
 			}
 			auth.GET("/supplier/dashboard-stats", h.GetSupplierStats)
 			auth.GET("/supplier/orders", h.GetSupplierSales)
+			auth.GET("/supplier/orders/:id", h.GetSupplierOrderDetails)
 		}
 
 		// --- Manager-Only Routes ---

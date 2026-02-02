@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"database/sql"
+	"encoding/json"
 	"net/http"
 	"time"
 
@@ -48,10 +49,12 @@ func (h *Handlers) getOrCreateCartID(tx *sql.Tx, userID int64) (int64, error) {
 // AddToCartInput defines the JSON for adding an item to the cart.
 // FIX: Updated tags to match the snake_case sent by cartService.ts
 type AddToCartInput struct {
-	ProductID int64 `json:"product_id" binding:"required"`
-	Quantity  int   `json:"quantity" binding:"required,gt=0"`
+	ProductID int64  `json:"product_id" binding:"required"`
+	VariantID *int64 `json:"variant_id"` // [NEW] Optional variant selection
+	Quantity  int    `json:"quantity" binding:"required,gt=0"`
 }
 
+// [FIXED] AddToCart: Handles both Simple and Variable Products
 func (h *Handlers) AddToCart(c *gin.Context) {
 	userID_raw, _ := c.Get("userID")
 	dropshipperID := userID_raw.(int64)
@@ -75,16 +78,34 @@ func (h *Handlers) AddToCart(c *gin.Context) {
 		return
 	}
 
-	// Logic check: Ensure the product is 'active' (our new ENUM value)
+	// [FIX] Phase 8.4: Determine price and stock based on Variant vs Base Product
 	var stock int
-	err = tx.QueryRow("SELECT stock_quantity FROM products WHERE id = ? AND status = 'active'", input.ProductID).Scan(&stock)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			c.JSON(http.StatusNotFound, gin.H{"error": "Product not found or not active"})
+	var price float64
+
+	// If VariantID is provided and > 0, check the VARIANT table
+	if input.VariantID != nil && *input.VariantID > 0 {
+		err = tx.QueryRow(`
+			SELECT stock_quantity, price_to_tts 
+			FROM product_variants 
+			WHERE id = ? AND product_id = ?`,
+			*input.VariantID, input.ProductID).Scan(&stock, &price)
+
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Selected variant not found"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
-		return
+	} else {
+		// Otherwise, check the BASE PRODUCT table
+		err = tx.QueryRow(`
+			SELECT stock_quantity, price_to_tts 
+			FROM products 
+			WHERE id = ? AND status = 'active'`,
+			input.ProductID).Scan(&stock, &price)
+
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Product not found or inactive"})
+			return
+		}
 	}
 
 	if stock < input.Quantity {
@@ -92,17 +113,44 @@ func (h *Handlers) AddToCart(c *gin.Context) {
 		return
 	}
 
-	// Insert or Update logic (Upsert)
-	_, err = tx.Exec(`
-		INSERT INTO cart_items (cart_id, product_id, quantity, updated_at)
-		VALUES (?, ?, ?, NOW())
-		ON DUPLICATE KEY UPDATE 
-			quantity = quantity + VALUES(quantity),
-			updated_at = NOW()`,
-		cartID, input.ProductID, input.Quantity)
+	// [FIX] Manual Check-and-Update to avoid SQL "Unique NULL" headaches
+	var existingQty int
+	var checkQuery string
+	var checkArgs []interface{}
+
+	if input.VariantID != nil && *input.VariantID > 0 {
+		checkQuery = "SELECT quantity FROM cart_items WHERE cart_id = ? AND product_id = ? AND variant_id = ?"
+		checkArgs = []interface{}{cartID, input.ProductID, *input.VariantID}
+	} else {
+		checkQuery = "SELECT quantity FROM cart_items WHERE cart_id = ? AND product_id = ? AND variant_id IS NULL"
+		checkArgs = []interface{}{cartID, input.ProductID}
+	}
+
+	err = tx.QueryRow(checkQuery, checkArgs...).Scan(&existingQty)
+
+	if err == nil {
+		// Item exists -> Update Quantity
+		updateQuery := "UPDATE cart_items SET quantity = quantity + ?, updated_at = NOW() WHERE cart_id = ? AND product_id = ?"
+		updateArgs := []interface{}{input.Quantity, cartID, input.ProductID}
+
+		if input.VariantID != nil && *input.VariantID > 0 {
+			updateQuery += " AND variant_id = ?"
+			updateArgs = append(updateArgs, *input.VariantID)
+		} else {
+			updateQuery += " AND variant_id IS NULL"
+		}
+
+		_, err = tx.Exec(updateQuery, updateArgs...)
+	} else {
+		// Item does not exist -> Insert New
+		_, err = tx.Exec(`
+			INSERT INTO cart_items (cart_id, product_id, variant_id, quantity, updated_at)
+			VALUES (?, ?, ?, ?, NOW())`,
+			cartID, input.ProductID, input.VariantID, input.Quantity)
+	}
 
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update cart"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update cart items"})
 		return
 	}
 
@@ -128,84 +176,84 @@ type CartItemResponse struct {
 
 // GetCart is the handler for GET /v1/dropshipper/cart
 // It retrieves the full contents of the user's cart.
+// [FIXED] GetCart: Joins with Variants AND fetches Options for display
 func (h *Handlers) GetCart(c *gin.Context) {
-	// 1. --- Get Dropshipper ID ---
 	userID_raw, _ := c.Get("userID")
 	dropshipperID := userID_raw.(int64)
 
-	// 2. --- Find the Cart ---
 	var cartID int64
 	err := h.DB.QueryRow("SELECT id FROM carts WHERE user_id = ?", dropshipperID).Scan(&cartID)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			// No cart exists. Return an empty cart response.
-			c.JSON(http.StatusOK, gin.H{
-				"items":      []CartItemResponse{},
-				"subtotal":   0.0,
-				"totalItems": 0,
-			})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to find cart"})
+		c.JSON(http.StatusOK, gin.H{"items": []interface{}{}, "subtotal": 0})
 		return
 	}
 
-	// 3. --- Query for Cart Items + Product Details ---
-	// UPDATED: Query selects p.price_to_tts and p.stock_quantity
+	// [CHANGE 1] Added 'v.options' to the SELECT statement
 	query := `
 		SELECT
-			ci.product_id, p.name, p.sku, p.price_to_tts, ci.quantity, p.stock_quantity
+			ci.product_id, 
+			p.name, 
+			COALESCE(v.sku, p.sku) as display_sku, 
+			COALESCE(v.price_to_tts, p.price_to_tts) as unit_price, 
+			ci.quantity, 
+			COALESCE(v.stock_quantity, p.stock_quantity) as stock,
+            v.options  -- <--- WE NEED THIS
 		FROM cart_items ci
 		JOIN products p ON ci.product_id = p.id
+		LEFT JOIN product_variants v ON ci.variant_id = v.id
 		WHERE ci.cart_id = ? AND p.status = 'active'
 	`
 	rows, err := h.DB.Query(query, cartID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query cart items"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch cart"})
 		return
 	}
 	defer rows.Close()
 
-	// 4. --- Scan Rows and Calculate Totals ---
-	var items []CartItemResponse
-	var subtotal float64 = 0.0
-	var totalItems int = 0
-
-	var productSKU sql.NullString // Handle NULLable SKU
+	var items []gin.H
+	var subtotal float64
 
 	for rows.Next() {
-		var item CartItemResponse
-		// UPDATED: Scan into item.Price and item.Stock
-		if err := rows.Scan(
-			&item.ProductID,
-			&item.Name,
-			&productSKU,
-			&item.Price, // Scans 'price_to_tts' into 'Price'
-			&item.Quantity,
-			&item.Stock, // Scans 'stock_quantity' into 'Stock'
-		); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to scan cart item"})
-			return
+		var pid int64
+		var name, sku string
+		var price float64
+		var qty, stock int
+		var optionsJSON []byte // [CHANGE 2] Buffer to catch the JSON string
+
+		// [CHANGE 3] Scan the optionsJSON
+		err := rows.Scan(&pid, &name, &sku, &price, &qty, &stock, &optionsJSON)
+		if err != nil {
+			continue
 		}
 
-		item.SKU = productSKU.String // Convert sql.NullString to string
-		item.LineTotal = item.Price * float64(item.Quantity)
-		subtotal += item.LineTotal
-		totalItems += item.Quantity
+		lineTotal := price * float64(qty)
+		subtotal += lineTotal
 
-		items = append(items, item)
+		// [CHANGE 4] Parse the options so React can display "Color: Red"
+		var options []map[string]string
+		if len(optionsJSON) > 0 {
+			_ = json.Unmarshal(optionsJSON, &options)
+		}
+
+		items = append(items, gin.H{
+			"product_id":   pid,
+			"product_name": name, // Ensure frontend uses this key
+			"name":         name, // Duplicate for safety if frontend uses 'name'
+			"sku":          sku,
+			"unit_price":   price,
+			"price":        price, // Duplicate for safety
+			"quantity":     qty,
+			"stock":        stock,
+			"lineTotal":    lineTotal,
+			"options":      options, // <--- Send the parsed options to Frontend
+		})
 	}
 
-	if err = rows.Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error iterating cart items"})
-		return
-	}
-
-	// 5. --- Send Success Response ---
 	c.JSON(http.StatusOK, gin.H{
-		"items":      items,
-		"subtotal":   subtotal,
-		"totalItems": totalItems,
+		"items":       items,
+		"subtotal":    subtotal,
+		"total_items": len(items),
+		"grand_total": subtotal,
 	})
 }
 
