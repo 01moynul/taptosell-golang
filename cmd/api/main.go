@@ -65,7 +65,7 @@ func main() {
 	// It runs every 1 hour to clean up unpaid orders.
 	go func() {
 		// Create a ticker that ticks every 1 hour
-		ticker := time.NewTicker(1 * time.Hour) // TEMPORARY TEST
+		ticker := time.NewTicker(10 * time.Second) // TEMPORARY TEST
 		defer ticker.Stop()
 
 		log.Println("🕒 Background Worker Started: Monitoring for overdue orders...")
