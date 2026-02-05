@@ -1,6 +1,7 @@
 # Security: Never commit environment variables
 .env
 
+.md
 # Local Editor History (VS Code extensions)
 .history/
 uploads
