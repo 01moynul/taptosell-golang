@@ -381,6 +381,9 @@ func (h *Handlers) GetMyProducts(c *gin.Context) {
 
 // --- Product Update ---
 
+// internal/handlers/product_handlers.go
+
+// 1. Update the Struct to accept Media and Variants
 type UpdateProductInput struct {
 	Name        *string `json:"name"`
 	Description *string `json:"description"`
@@ -391,20 +394,29 @@ type UpdateProductInput struct {
 
 	CategoryIDs *[]int64 `json:"category_ids"`
 
+	// --- MISSING FIELDS ADDED BELOW ---
+	Images          *[]string               `json:"images"`          // Pointer to array
+	VideoURL        *string                 `json:"videoUrl"`        // Pointer to string
+	SizeChart       *map[string]interface{} `json:"sizeChart"`       // Pointer to map
+	VariationImages *map[string]string      `json:"variationImages"` // Pointer to map
+
+	IsVariable *bool `json:"isVariable"` // Allow switching types? Usually risky, but adding for completeness
+
 	SimpleProduct  *SimpleProductInput `json:"simpleProduct,omitempty"`
-	Variants       []VariantInput      `json:"variants,omitempty"`
+	Variants       *[]VariantInput     `json:"variants,omitempty"` // Changed to pointer
 	CommissionRate *float64            `json:"commissionRate,omitempty" binding:"omitempty,gte=0"`
 
 	Weight            *float64                `json:"weight" binding:"omitempty,gt=0"`
 	PackageDimensions *PackageDimensionsInput `json:"packageDimensions,omitempty"`
 }
 
-// UpdateProduct is the handler for PUT /v1/products/:id
+// 2. Update the Handler to Process these fields
 func (h *Handlers) UpdateProduct(c *gin.Context) {
 	userID_raw, _ := c.Get("userID")
 	supplierID := userID_raw.(int64)
 	productIDStr := c.Param("id")
 
+	// Check ownership
 	var currentProduct models.Product
 	err := h.DB.QueryRow("SELECT id, status, price_to_tts, is_variable FROM products WHERE id = ? AND supplier_id = ?", productIDStr, supplierID).Scan(
 		&currentProduct.ID,
@@ -434,20 +446,11 @@ func (h *Handlers) UpdateProduct(c *gin.Context) {
 	}
 	defer tx.Rollback()
 
-	// 4.5 --- Price Change Validation ---
-	if currentProduct.Status == "active" && !currentProduct.IsVariable && input.SimpleProduct != nil {
-		if input.SimpleProduct.Price != currentProduct.PriceToTTS {
-			c.JSON(http.StatusForbidden, gin.H{
-				"error": "You cannot change the price of a 'active' product. Please use the 'Request Price Change' feature.",
-			})
-			return
-		}
-	}
-
-	// 5. --- Dynamically Build UPDATE Query ---
+	// --- Dynamic SQL Builder ---
 	querySet := "updated_at = ?"
 	queryArgs := []interface{}{time.Now()}
 
+	// Standard Fields
 	if input.Name != nil {
 		querySet += ", name = ?"
 		queryArgs = append(queryArgs, *input.Name)
@@ -460,53 +463,112 @@ func (h *Handlers) UpdateProduct(c *gin.Context) {
 		querySet += ", status = ?"
 		queryArgs = append(queryArgs, *input.Status)
 	}
+	if input.IsVariable != nil {
+		querySet += ", is_variable = ?"
+		queryArgs = append(queryArgs, *input.IsVariable)
+		currentProduct.IsVariable = *input.IsVariable // Update local tracking
+	}
+
+	// --- MEDIA FIELDS (These were missing!) ---
+	if input.Images != nil {
+		imagesJSON, _ := json.Marshal(*input.Images)
+		querySet += ", images = ?"
+		queryArgs = append(queryArgs, string(imagesJSON))
+	}
+	if input.VideoURL != nil {
+		querySet += ", video_url = ?"
+		queryArgs = append(queryArgs, *input.VideoURL)
+	}
+	if input.SizeChart != nil {
+		chartJSON, _ := json.Marshal(*input.SizeChart)
+		querySet += ", size_chart = ?"
+		queryArgs = append(queryArgs, string(chartJSON))
+	}
+	if input.VariationImages != nil {
+		varImgJSON, _ := json.Marshal(*input.VariationImages)
+		querySet += ", variation_images = ?"
+		queryArgs = append(queryArgs, string(varImgJSON))
+	}
+
+	// --- Dimensions ---
 	if input.Weight != nil {
 		querySet += ", weight = ?"
 		queryArgs = append(queryArgs, *input.Weight)
+		// Auto update grams
+		querySet += ", weight_grams = ?"
+		queryArgs = append(queryArgs, int(*input.Weight*1000))
 	}
 	if input.PackageDimensions != nil {
 		querySet += ", pkg_length = ?, pkg_width = ?, pkg_height = ?"
 		queryArgs = append(queryArgs, input.PackageDimensions.Length, input.PackageDimensions.Width, input.PackageDimensions.Height)
 	}
 
+	// --- Simple vs Variable Logic ---
+	// Note: We use the *current* state of the product unless input.IsVariable changed it
 	if !currentProduct.IsVariable && input.SimpleProduct != nil {
 		querySet += ", price_to_tts = ?, stock_quantity = ?, sku = ?"
 		queryArgs = append(queryArgs, input.SimpleProduct.Price, input.SimpleProduct.Stock, input.SimpleProduct.SKU)
+		querySet += ", srp = ?" // Update SRP too
+		queryArgs = append(queryArgs, input.SimpleProduct.SRP)
+
 		if input.SimpleProduct.CommissionRate != nil {
 			querySet += ", commission_rate = ?"
 			queryArgs = append(queryArgs, *input.SimpleProduct.CommissionRate)
 		}
-	} else if currentProduct.IsVariable && input.CommissionRate != nil {
-		querySet += ", commission_rate = ?"
-		queryArgs = append(queryArgs, *input.CommissionRate)
+	} else if currentProduct.IsVariable && input.Variants != nil {
+		// Calculate Roll-up values for Variable Products
+		var totalStock int
+		var minPrice float64 = 0
+		if len(*input.Variants) > 0 {
+			minPrice = (*input.Variants)[0].Price
+		}
+
+		for _, v := range *input.Variants {
+			totalStock += v.Stock
+			if v.Price < minPrice {
+				minPrice = v.Price
+			}
+		}
+		querySet += ", price_to_tts = ?, stock_quantity = ?"
+		queryArgs = append(queryArgs, minPrice, totalStock)
+
+		if input.CommissionRate != nil {
+			querySet += ", commission_rate = ?"
+			queryArgs = append(queryArgs, *input.CommissionRate)
+		}
 	}
 
-	queryArgs = append(queryArgs, productIDStr)
+	// Execute Main Product Update
+	queryArgs = append(queryArgs, productIDStr) // Add ID for WHERE clause
 	query := fmt.Sprintf("UPDATE products SET %s WHERE id = ?", querySet)
 
 	_, err = tx.Exec(query, queryArgs...)
 	if err != nil {
+		fmt.Printf("SQL Error: %v\n", err) // Debug log
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update core product details"})
 		return
 	}
 
+	// --- Categories Update ---
 	if input.CategoryIDs != nil {
 		_, err := tx.Exec("DELETE FROM product_categories WHERE product_id = ?", productIDStr)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to clear old categories"})
 			return
 		}
-
-		categoryQuery := `INSERT INTO product_categories (product_id, category_id) VALUES (?, ?)`
-		for _, catID := range *input.CategoryIDs {
-			_, err := tx.Exec(categoryQuery, productIDStr, catID)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to link new category"})
-				return
+		if len(*input.CategoryIDs) > 0 {
+			categoryQuery := `INSERT INTO product_categories (product_id, category_id) VALUES (?, ?)`
+			for _, catID := range *input.CategoryIDs {
+				_, err := tx.Exec(categoryQuery, productIDStr, catID)
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to link new category"})
+					return
+				}
 			}
 		}
 	}
 
+	// --- Brand Update ---
 	if input.BrandID != nil || (input.BrandName != nil && *input.BrandName != "") {
 		brandNameStr := ""
 		if input.BrandName != nil {
@@ -517,10 +579,37 @@ func (h *Handlers) UpdateProduct(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-		_, err = tx.Exec("UPDATE product_brands SET brand_id = ? WHERE product_id = ?", newBrandID, productIDStr)
+		// Upsert logic for brand link
+		_, err = tx.Exec("DELETE FROM product_brands WHERE product_id = ?", productIDStr)
+		_, err = tx.Exec("INSERT INTO product_brands (product_id, brand_id) VALUES (?, ?)", productIDStr, newBrandID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update brand link"})
 			return
+		}
+	}
+
+	// --- Variant Update (Full Replace Strategy) ---
+	// If variants are provided, we replace them to ensure consistency
+	if currentProduct.IsVariable && input.Variants != nil {
+		_, err := tx.Exec("DELETE FROM product_variants WHERE product_id = ?", productIDStr)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to clear old variants"})
+			return
+		}
+
+		varQ := `INSERT INTO product_variants (product_id, sku, price_to_tts, stock_quantity, options, commission_rate, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+		for _, v := range *input.Variants {
+			optJSON, _ := json.Marshal(v.Options)
+			var vSku *string
+			if v.SKU != "" {
+				s := v.SKU
+				vSku = &s
+			}
+			_, err := tx.Exec(varQ, productIDStr, vSku, v.Price, v.Stock, string(optJSON), v.CommissionRate, time.Now(), time.Now())
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save variants"})
+				return
+			}
 		}
 	}
 
