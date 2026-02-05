@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"os"
+	"time"
 
 	"github.com/01moynul/taptosell-golang/internal/ai" // ADDED: Import AI package
 	"github.com/01moynul/taptosell-golang/internal/database"
@@ -59,6 +60,21 @@ func main() {
 		DBReadOnly: dbReadOnly, // Read-Only connection for AI security
 		AIService:  aiService,  // ADDED: Injected AI Service
 	}
+	// --- 4. Background Workers (Cron) ---
+	// Start the "Garbage Collector" in a separate thread (Goroutine).
+	// It runs every 1 hour to clean up unpaid orders.
+	go func() {
+		// Create a ticker that ticks every 1 hour
+		ticker := time.NewTicker(1 * time.Hour) // TEMPORARY TEST
+		defer ticker.Stop()
+
+		log.Println("🕒 Background Worker Started: Monitoring for overdue orders...")
+
+		for range ticker.C {
+			// This code runs every time the clock hits 1 hour
+			app.ProcessOverdueOrders()
+		}
+	}()
 
 	// --- Router Setup ---
 	router := routes.SetupRouter(app)

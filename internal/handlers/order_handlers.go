@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"time"
 
@@ -669,4 +670,108 @@ func (h *Handlers) GetSupplierOrderDetails(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"items": items,
 	})
+}
+
+// ProcessOverdueOrders checks for unpaid orders older than 24 hours.
+// It cancels them, RESTORES the stock, and adds a penalty strike.
+func (h *Handlers) ProcessOverdueOrders() {
+	// 1. Define cutoff (24 hours ago)
+	cutoffTime := time.Now().Add(-24 * time.Hour)
+	log.Printf("[Cron] Checking for on-hold orders older than %v", cutoffTime)
+
+	// 2. Find target orders
+	query := `SELECT id, user_id FROM orders WHERE status = 'on-hold' AND created_at < ?`
+	rows, err := h.DB.Query(query, cutoffTime)
+	if err != nil {
+		log.Printf("[Cron] Error fetching overdue orders: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	var ordersToCancel []struct {
+		ID     int64
+		UserID int64
+	}
+
+	for rows.Next() {
+		var o struct {
+			ID     int64
+			UserID int64
+		}
+		if err := rows.Scan(&o.ID, &o.UserID); err != nil {
+			log.Printf("[Cron] Error scanning row: %v", err)
+			continue
+		}
+		ordersToCancel = append(ordersToCancel, o)
+	}
+
+	// 3. Process each order
+	for _, o := range ordersToCancel {
+		h.cancelAndPenalize(o.ID, o.UserID)
+	}
+}
+
+// cancelAndPenalize performs the atomic update: Cancel Order -> Restore Stock -> Strike User
+func (h *Handlers) cancelAndPenalize(orderID, userID int64) {
+	tx, err := h.DB.Begin()
+	if err != nil {
+		log.Printf("[Cron] Failed to begin tx for Order %d: %v", orderID, err)
+		return
+	}
+	defer tx.Rollback()
+
+	// A. Restore Stock (Because we reserved it during Checkout)
+	rows, err := tx.Query("SELECT product_id, variant_id, quantity FROM order_items WHERE order_id = ?", orderID)
+	if err != nil {
+		log.Printf("[Cron] Failed to fetch items for Order %d: %v", orderID, err)
+		return
+	}
+
+	type ItemToRestore struct {
+		ProductID int64
+		VariantID *int64
+		Quantity  int
+	}
+	var items []ItemToRestore
+
+	for rows.Next() {
+		var i ItemToRestore
+		if err := rows.Scan(&i.ProductID, &i.VariantID, &i.Quantity); err == nil {
+			items = append(items, i)
+		}
+	}
+	rows.Close() // Close immediately after scanning
+
+	for _, item := range items {
+		if item.VariantID != nil && *item.VariantID > 0 {
+			_, err = tx.Exec("UPDATE product_variants SET stock_quantity = stock_quantity + ? WHERE id = ?", item.Quantity, *item.VariantID)
+		} else {
+			_, err = tx.Exec("UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ?", item.Quantity, item.ProductID)
+		}
+		if err != nil {
+			log.Printf("[Cron] Failed to restore stock for Order %d: %v", orderID, err)
+			return
+		}
+	}
+
+	// B. Update Order Status
+	_, err = tx.Exec("UPDATE orders SET status = 'cancelled', updated_at = ? WHERE id = ?", time.Now(), orderID)
+	if err != nil {
+		log.Printf("[Cron] Failed to cancel Order %d: %v", orderID, err)
+		return
+	}
+
+	// C. Increment User Penalty Strikes
+	_, err = tx.Exec("UPDATE users SET penalty_strikes = penalty_strikes + 1, updated_at = ? WHERE id = ?", time.Now(), userID)
+	if err != nil {
+		log.Printf("[Cron] Failed to penalize User %d: %v", userID, err)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.Printf("[Cron] Failed to commit tx for Order %d: %v", orderID, err)
+		return
+	}
+
+	log.Printf("[Cron] SUCCESS: Order %d cancelled, Stock restored, User %d penalized.", orderID, userID)
 }
